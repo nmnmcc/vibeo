@@ -1,0 +1,7 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./workspaces/main" },
+    { "path": "./workspaces/worker" }
+  ]
+}

@@ -11,6 +11,8 @@ COPY sh /sh
 COPY js /js
 COPY py /py
 
+COPY pi /pi
+
 RUN --mount=type=cache,id=vibeo-worker-npm,target=/root/.npm,sharing=locked \
   --mount=type=cache,id=vibeo-worker-uv,target=/root/.cache/uv,sharing=locked \
   nix develop --no-update-lock-file path:/x#install --command sh /sh/init.sh
@@ -23,9 +25,9 @@ RUN nix develop --no-update-lock-file path:/x --command true
 
 WORKDIR /workspace
 
+RUN git init
+
 ENV PATH="$PATH:/js/node_modules/.bin:/py/.venv/bin"
 
-EXPOSE 4096
-
 ENTRYPOINT ["nix", "develop", "--no-update-lock-file", "path:/x", "--command"]
-CMD ["opencode", "serve", "--hostname=0.0.0.0", "--port=4096"]
+CMD ["pi", "--mode", "rpc"]

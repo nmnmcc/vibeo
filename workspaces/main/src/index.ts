@@ -1,230 +1,321 @@
-import { createOpencodeClient, type OpencodeClient, type Workspace } from "@opencode-ai/sdk/v2";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const self = fileURLToPath(import.meta.url);
-const script = path.join(path.dirname(self), "./opencode-server.sh");
-const remoteDirectory = process.env["OPENCODE_REMOTE_DIRECTORY"] ?? "/workspace";
+const runner = path.join(path.dirname(self), "./pi-run.sh");
 const prompt = process.argv.slice(2).join(" ").trim() || "123";
 
-const server = await startOpencodeServer({
-  script,
-  hostname: process.env["OPENCODE_HOSTNAME"] ?? "127.0.0.1",
-  port: readPort(process.env["OPENCODE_PORT"]),
-  timeoutMs: readTimeout(process.env["OPENCODE_START_TIMEOUT_MS"]),
+const result = await runPi({
+  runner,
+  prompt,
+  timeoutMs: readOptionalPositiveInteger(process.env["VIBEO_PI_TIMEOUT_MS"], "VIBEO_PI_TIMEOUT_MS"),
 });
 
-try {
-  const client = createOpencodeClient({
-    baseUrl: server.url,
-    directory: remoteDirectory,
-    ...serverAuthConfig(),
-  });
+console.log(JSON.stringify(result, null, 2));
 
-  const health = await client.global.health({ throwOnError: true });
-  const workspace = await ensureWorkspace(client, remoteDirectory);
-  const workspaceParams = workspace
-    ? {
-        workspace: workspace.id,
-        workspaceID: workspace.id,
-      }
-    : {};
-  const session = await client.session.create(
-    {
-      directory: remoteDirectory,
-      title: prompt,
-      ...workspaceParams,
-    },
-    { throwOnError: true },
-  );
-
-  const message = await client.session.prompt(
-    {
-      directory: remoteDirectory,
-      sessionID: session.data.id,
-      ...(workspace ? { workspace: workspace.id } : {}),
-      parts: [{ type: "text", text: prompt }],
-    },
-    { throwOnError: true },
-  );
-
-  console.log(
-    JSON.stringify(
-      {
-        server: server.url,
-        version: health.data.version,
-        workspace,
-        session: session.data,
-        message: message.data,
-      },
-      null,
-      2,
-    ),
-  );
-} finally {
-  server.close();
-}
-
-type ServerOptions = {
-  script: string;
-  hostname: string;
-  port: number;
-  timeoutMs: number;
+type PiRunOptions = {
+  runner: string;
+  prompt: string;
+  timeoutMs: number | undefined;
 };
 
-type ServerHandle = {
-  url: string;
-  close(): void;
+type PiRunResult = {
+  runner: "pi";
+  prompt: string;
+  args: string[];
+  response: string;
+  tools: PiToolEvent[];
+  messages: unknown[];
+  events: PiEventSummary[];
+  stderr?: string;
+  nonJsonOutput?: string[];
 };
 
-async function ensureWorkspace(client: OpencodeClient, directory: string): Promise<Workspace | undefined> {
-  if (process.env["OPENCODE_WORKSPACE_DISABLED"] === "1") {
-    return undefined;
-  }
+type PiEventSummary =
+  | {
+      type: "agent_start" | "agent_end" | "turn_start";
+    }
+  | {
+      type: "turn_end";
+      toolResultCount: number;
+    }
+  | {
+      type: "message_start" | "message_end";
+      messageType: string | undefined;
+    }
+  | {
+      type: "message_update";
+      updateType: string | undefined;
+    }
+  | PiToolEvent
+  | {
+      type: string;
+    };
 
-  const id = process.env["OPENCODE_WORKSPACE_ID"] ?? "vibeo";
-  const requestedType = process.env["OPENCODE_WORKSPACE_TYPE"];
+type PiToolEvent = {
+  type: "tool_execution_start" | "tool_execution_update" | "tool_execution_end";
+  toolCallId: string | undefined;
+  toolName: string | undefined;
+  isError?: boolean;
+};
 
-  const list = await client.experimental.workspace.list({ directory }, { throwOnError: true });
-  const existing = list.data.find((workspace) => workspace.id === id);
+type PiJsonEvent = {
+  type?: unknown;
+  [key: string]: unknown;
+};
 
-  if (existing) {
-    return existing;
-  }
+async function runPi(options: PiRunOptions): Promise<PiRunResult> {
+  const args = buildPiArgs(options.prompt);
+  const events: PiEventSummary[] = [];
+  const tools: PiToolEvent[] = [];
+  const messages: unknown[] = [];
+  const response: string[] = [];
+  const nonJsonOutput: string[] = [];
+  let stderr = "";
+  let stdoutBuffer = "";
 
-  const adapters = await client.experimental.workspace.adapter.list({ directory }, { throwOnError: true });
-  const type = requestedType ?? adapters.data[0]?.type;
-
-  if (!type) {
-    throw new Error("No opencode workspace adapter is available for this project.");
-  }
-
-  const created = await client.experimental.workspace.create(
-    {
-      directory,
-      id,
-      type,
-    },
-    { throwOnError: true },
-  );
-
-  return created.data;
-}
-
-async function startOpencodeServer(options: ServerOptions): Promise<ServerHandle> {
-  const processEnv = {
-    ...process.env,
-    OPENCODE_HOSTNAME: options.hostname,
-    OPENCODE_PORT: String(options.port),
-  };
-
-  const proc = spawn(options.script, [], {
-    env: processEnv,
+  const proc = spawn(options.runner, args, {
+    env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  return new Promise((resolve, reject) => {
-    let output = "";
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      rejectOnce(new Error(`Timed out waiting for opencode server after ${options.timeoutMs}ms.`));
+  let timer: NodeJS.Timeout | undefined;
+  if (options.timeoutMs !== undefined) {
+    timer = setTimeout(() => {
       stopProcess(proc);
     }, options.timeoutMs);
+  }
 
-    const rejectOnce = (error: Error) => {
-      if (settled) {
+  proc.stdout.setEncoding("utf8");
+  proc.stdout.on("data", (chunk: string) => {
+    stdoutBuffer += chunk;
+    stdoutBuffer = drainJsonLines(stdoutBuffer, (line) => {
+      const event = parsePiEvent(line);
+
+      if (!event) {
+        nonJsonOutput.push(line);
         return;
       }
 
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    };
+      const summary = summarizePiEvent(event);
+      events.push(summary);
 
-    const resolveOnce = () => {
-      if (settled) {
-        return;
+      if (isToolEvent(summary)) {
+        tools.push(summary);
       }
 
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        url: `http://${options.hostname}:${options.port}`,
-        close() {
-          stopProcess(proc);
-        },
-      });
-    };
-
-    const collectOutput = (chunk: Buffer) => {
-      output += chunk.toString();
-
-      if (output.includes("opencode server listening")) {
-        resolveOnce();
-      }
-    };
-
-    proc.stdout?.on("data", collectOutput);
-    proc.stderr?.on("data", collectOutput);
-    proc.on("error", (error) => {
-      rejectOnce(error);
+      collectAssistantText(event, response);
+      collectAgentMessages(event, messages);
     });
+  });
+
+  proc.stderr.setEncoding("utf8");
+  proc.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on("error", (error) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      reject(error);
+    });
+
     proc.on("exit", (code, signal) => {
-      if (settled) {
+      if (timer) {
+        clearTimeout(timer);
+      }
+
+      const remaining = stdoutBuffer.trim();
+      if (remaining) {
+        const event = parsePiEvent(remaining);
+        if (event) {
+          const summary = summarizePiEvent(event);
+          events.push(summary);
+          if (isToolEvent(summary)) {
+            tools.push(summary);
+          }
+          collectAssistantText(event, response);
+          collectAgentMessages(event, messages);
+        } else {
+          nonJsonOutput.push(remaining);
+        }
+      }
+
+      if (code !== 0) {
+        const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+        reject(new Error(`pi exited with code=${code ?? "null"} signal=${signal ?? "null"}${suffix}`));
         return;
       }
 
-      const suffix = output.trim() ? `\n${output.trim()}` : "";
-      rejectOnce(new Error(`opencode server exited before it was ready: code=${code ?? "null"} signal=${signal ?? "null"}${suffix}`));
+      resolve({
+        runner: "pi",
+        prompt: options.prompt,
+        args,
+        response: response.join(""),
+        tools,
+        messages,
+        events,
+        ...(stderr.trim() ? { stderr: stderr.trim() } : {}),
+        ...(nonJsonOutput.length > 0 ? { nonJsonOutput } : {}),
+      });
     });
   });
 }
 
-function readPort(value: string | undefined): number {
-  if (!value) {
-    return 4096;
-  }
+function buildPiArgs(prompt: string): string[] {
+  const args = ["--mode", "json", "--print", "--no-session"];
 
-  const port = Number(value);
+  appendOption(args, "--provider", process.env["VIBEO_PI_PROVIDER"]);
+  appendOption(args, "--model", process.env["VIBEO_PI_MODEL"]);
+  appendOption(args, "--thinking", process.env["VIBEO_PI_THINKING"]);
+  appendOption(args, "--tools", process.env["VIBEO_PI_TOOLS"]);
 
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error(`Invalid OPENCODE_PORT: ${value}`);
-  }
-
-  return port;
+  args.push(prompt);
+  return args;
 }
 
-function serverAuthConfig(): { headers: Record<string, string> } | Record<string, never> {
-  const password = process.env["OPENCODE_SERVER_PASSWORD"];
-
-  if (!password) {
-    return {};
+function appendOption(args: string[], option: string, value: string | undefined): void {
+  if (value && value.trim()) {
+    args.push(option, value.trim());
   }
-
-  const username = process.env["OPENCODE_SERVER_USERNAME"] ?? "opencode";
-  const token = Buffer.from(`${username}:${password}`).toString("base64");
-
-  return {
-    headers: {
-      Authorization: `Basic ${token}`,
-    },
-  };
 }
 
-function readTimeout(value: string | undefined): number {
+function drainJsonLines(buffer: string, onLine: (line: string) => void): string {
+  let start = 0;
+
+  for (;;) {
+    const newline = buffer.indexOf("\n", start);
+    if (newline === -1) {
+      return buffer.slice(start);
+    }
+
+    const line = buffer.slice(start, newline).trim();
+    if (line) {
+      onLine(line);
+    }
+    start = newline + 1;
+  }
+}
+
+function parsePiEvent(line: string): PiJsonEvent | undefined {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (parsed && typeof parsed === "object") {
+      return parsed as PiJsonEvent;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function summarizePiEvent(event: PiJsonEvent): PiEventSummary {
+  const type = typeof event.type === "string" ? event.type : "unknown";
+
+  switch (type) {
+    case "agent_start":
+    case "agent_end":
+    case "turn_start":
+      return { type };
+    case "turn_end":
+      return { type, toolResultCount: readArray(event["toolResults"]).length };
+    case "message_start":
+    case "message_end":
+      return { type, messageType: readMessageType(event["message"]) };
+    case "message_update":
+      return { type, updateType: readAssistantMessageEventType(event["assistantMessageEvent"]) };
+    case "tool_execution_start":
+    case "tool_execution_update":
+    case "tool_execution_end":
+      return {
+        type,
+        toolCallId: readString(event["toolCallId"]),
+        toolName: readString(event["toolName"]),
+        ...(typeof event["isError"] === "boolean" ? { isError: event["isError"] } : {}),
+      };
+    default:
+      return { type };
+  }
+}
+
+function collectAssistantText(event: PiJsonEvent, response: string[]): void {
+  if (event.type !== "message_update") {
+    return;
+  }
+
+  const assistantMessageEvent = readObject(event["assistantMessageEvent"]);
+  if (!assistantMessageEvent || assistantMessageEvent["type"] !== "text_delta") {
+    return;
+  }
+
+  const delta = readString(assistantMessageEvent["delta"]);
+  if (delta !== undefined) {
+    response.push(delta);
+  }
+}
+
+function collectAgentMessages(event: PiJsonEvent, messages: unknown[]): void {
+  if (event.type !== "agent_end") {
+    return;
+  }
+
+  messages.push(...readArray(event["messages"]));
+}
+
+function isToolEvent(summary: PiEventSummary): summary is PiToolEvent {
+  return summary.type === "tool_execution_start" || summary.type === "tool_execution_update" || summary.type === "tool_execution_end";
+}
+
+function readAssistantMessageEventType(value: unknown): string | undefined {
+  const event = readObject(value);
+  if (!event) {
+    return undefined;
+  }
+
+  return readString(event["type"]);
+}
+
+function readMessageType(value: unknown): string | undefined {
+  const message = readObject(value);
+  if (!message) {
+    return undefined;
+  }
+
+  return readString(message["type"]);
+}
+
+function readObject(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return undefined;
+}
+
+function readArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function readOptionalPositiveInteger(value: string | undefined, name: string): number | undefined {
   if (!value) {
-    return 30_000;
+    return undefined;
   }
 
-  const timeout = Number(value);
+  const parsed = Number(value);
 
-  if (!Number.isInteger(timeout) || timeout <= 0) {
-    throw new Error(`Invalid OPENCODE_START_TIMEOUT_MS: ${value}`);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${name}: ${value}`);
   }
 
-  return timeout;
+  return parsed;
 }
 
 function stopProcess(proc: ChildProcess): void {
