@@ -1,0 +1,23 @@
+[project]
+name = "vibeo-worker-py"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "chanim>=1.3",
+  "manim>=0.19,<0.20",
+  "manim-algorithm>=0.0.4",
+  "manim-astronomy>=0.0.5",
+  "manim-automata>=0.2.14",
+  "manim-cad-drawing-utils>=0.0.5",
+  "manim-chemistry>=0.5.1",
+  "manim-chessrender>=0.1.2",
+  "manim-circuit>=0.0.3",
+  "manim-code-blocks-redux>=1.0.14",
+  "manim-dsa>=0.4.0",
+  "manim-gearbox>=0.2.4",
+  "manim-ml>=0.0.24",
+  "manim-physics>=0.2.4",
+  "manim-rubikscube>=0.1.0",
+  "manim-voiceover>=0.3.7",
+  "setuptools>=80.9.0",
+]
