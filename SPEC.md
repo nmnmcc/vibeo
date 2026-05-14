@@ -4,7 +4,7 @@
 
 Vibeo 是 Video + Vibe 的组合词，是一个由 AI Agent 驱动的视频生成平台，第一阶段主要面向教学视频生成。
 
-Vibeo 不直接使用视频生成模型来生成最终视频。系统会让 AI Agent 先理解教学目标，再编写结构化脚本，随后生成可执行的 Manim CE Python 代码，最后在隔离的 Worker 容器中渲染、抽帧、审查并迭代修正视频。
+Vibeo 不直接使用视频生成模型来生成最终视频。系统会让 AI Agent 先理解教学目标，再编写结构化脚本，随后生成可执行的 Manim CE Python 代码。Agent 每次形成一个可运行版本时，会将 Workspace 提交为 Git commit；系统监听 commit 并自动触发预览渲染。用户认可预览效果后，可以直接基于某个 commit 或预览版本触发高质量渲染，这一步不需要再经过 Agent。
 
 Vibeo 的核心判断是：教学视频需要准确、可控、可复现、可调试，而不是只追求“看起来像视频”。因此最终产物必须包含视频本身，也必须保留脚本、源码、渲染日志、抽帧结果和审查报告。
 
@@ -14,9 +14,12 @@ Vibeo 的核心判断是：教学视频需要准确、可控、可复现、可�
 用户需求
   -> 视频脚本
   -> Manim Python 代码
-  -> 渲染视频
+  -> Git commit
+  -> 自动预览渲染
   -> 抽帧审查
   -> 修正迭代
+  -> 用户确认
+  -> 高质量渲染
   -> 最终视频与完整产物
 ```
 
@@ -54,12 +57,15 @@ Vibeo 的核心判断是：教学视频需要准确、可控、可复现、可�
 后端需要满足：
 
 - `Project` 是用户可见的顶层资源，也是视频生成工作区、消息历史、预览版本和产物的归属边界。
-- 每个 Project 内置一个持续存在的 Agent 对话消息流，用户创建 Project 后即可开始对话。
-- 用户的每条消息都可以触发一次新生成、局部修改、重新渲染或审查请求。
-- Agent 的回复、阶段进度、工具调用、预览产物和错误都应以流式事件返回。
+- 每个 Project 内置一个持续存在的 Thread，Thread 保存用户、Agent 和工具结果消息。
+- 用户创建 Project 后即可发送消息；每条用户消息会创建一个 `AgentRun`。
+- `AgentRun` 是一次类 ChatGPT 的 Agent 执行过程：Agent 可以边回复、边调用工具、边产出预览和产物。
+- Agent 的文本回复、思考状态摘要、工具调用、工具结果、预览产物和错误都应以流式事件返回。
+- 脚本编写、Manim 编程和 Workspace commit 应表现为 Agent 工具调用。
+- 渲染应表现为系统能力：Agent 通过创建 Git commit 触发自动预览渲染，用户通过按钮触发高质量渲染。
 - 视频预览不是最终产物的附属品，而是生成过程中的一等产物。
 - 用户应能在任务完成前看到当前可用的预览，例如关键帧、场景片段、低质量渲染结果或最近一次完整渲染。
-- 后端应保留 Project 消息上下文、视频版本、Worker Git 版本和预览产物之间的关联。
+- 后端应保留 Project Thread、AgentRun、工具调用、视频版本、Worker Git 版本和预览产物之间的关联。
 
 ## 3. 非目标
 
@@ -86,7 +92,7 @@ Client
   v
 Server
   |
-  | Project、消息、任务、预览事件、Worker 调度
+  | Project、Thread、Message、AgentRun、工具事件、预览事件、Worker 调度
   v
 Kubernetes
   |
@@ -105,80 +111,84 @@ Database + Object Storage
 
 ## 5. Server 规格
 
-Server 是 Vibeo 的控制平面，对外暴露稳定 API，并负责把一次视频生成任务编排成可观测、可恢复的后台流程。
+Server 是 Vibeo 的控制平面，对外暴露稳定 API，并负责把 Project 内的一次用户消息编排成可观测、可恢复、可流式输出的 AgentRun。
 
 ### 5.1 职责
 
 - 接收用户的视频生成请求。
-- 管理 Project 和 Project 内的消息历史。
-- 校验请求参数并创建任务。
-- 持久化任务状态、阶段进度、错误信息和产物引用。
+- 管理 Project、Thread 和 Project 内的消息历史。
+- 校验用户消息并创建 AgentRun。
+- 持久化 Run 状态、Run Step、工具调用、错误信息和产物引用。
 - 持久化预览版本和 Worker Git 提交引用。
 - 创建、监控和清理 Worker。
 - 向客户端提供轮询接口和事件流。
-- 管理任务取消、重试和超时。
+- 管理 Run 取消、重试、恢复和超时。
 - 记录模型调用、渲染耗时、资源消耗和成本指标。
 
-### 5.2 任务状态机
+### 5.2 AgentRun 状态机
 
-任务状态应尽量稳定，方便客户端实现进度展示。
+Project 内每条用户消息都会创建一个 `AgentRun`。Run 状态应尽量稳定，方便客户端实现类 ChatGPT 的“正在回复、正在调用工具、已完成、可继续追问”的体验。
 
 ```text
-created
-  -> queued
-  -> worker_starting
-  -> planning
-  -> writing
-  -> programming
-  -> rendering
-  -> reviewing
-  -> revising
+queued
+  -> in_progress
+  -> streaming_response
+  -> calling_tool
+  -> waiting_for_tool
+  -> streaming_response
   -> completed
 
 failed
+requires_user_input
+cancelling
 cancelled
 expired
 ```
 
 状态说明：
 
-- `created`：Server 已接收请求。
-- `queued`：任务已入队，等待 Worker。
-- `worker_starting`：Worker 正在启动。
-- `planning`：General Agent 正在理解任务并制定执行计划。
-- `writing`：Writer Agent 正在编写视频脚本。
-- `programming`：Programmer Agent 正在生成或修改 Manim 代码。
-- `rendering`：Reviewer Agent 或渲染工具正在执行 Manim 渲染。
-- `reviewing`：Reviewer Agent 正在基于日志和抽帧结果审查视频。
-- `revising`：审查未通过，正在回到 Programmer 修正。
-- `completed`：任务完成并可下载最终产物。
-- `failed`：任务失败，且当前不能自动恢复。
-- `cancelled`：用户或系统取消任务。
-- `expired`：任务超时或 Worker 生命周期结束。
+- `queued`：用户消息已保存，Run 等待调度。
+- `in_progress`：Agent 已开始处理上下文。
+- `streaming_response`：Agent 正在向用户流式输出文本或结构化消息。
+- `calling_tool`：Agent 决定调用一个工具，例如编写脚本、修改代码、提交 Workspace 或审查视频。
+- `waiting_for_tool`：工具正在 Worker 内执行，Run 仍保持活跃并持续推送工具进度。
+- `requires_user_input`：Agent 需要用户选择或确认才能继续，例如确认风格方向或是否接受带警告结果。
+- `completed`：Run 已完成，Assistant 消息已落库，必要产物已关联到 Project。
+- `failed`：Run 失败，且当前不能自动恢复。
+- `cancelling`：用户请求停止当前 Run，Server 正在终止 Worker 工具调用。
+- `cancelled`：用户或系统取消 Run。
+- `expired`：Run 超时或 Worker 生命周期结束。
+
+视频制作阶段不应暴露为顶层状态机。`planning`、`writing`、`programming`、`committing`、`reviewing` 和 `revising` 应作为 Run Step 或 ToolCall 的状态出现在事件流中。`rendering` 应作为独立 `RenderJob` 状态出现在 Project 事件流中。
 
 ### 5.3 Worker 编排
 
 Server 通过 Kubernetes 编排 Worker：
 
-- 每个任务默认启动一个独立 Worker Pod。
+- 每个 Project 可以按需启动一个临时 Worker，也可以让一个 Worker 在 Project 活跃期内处理多个连续 Run。
+- MVP 可采用每个 Run 启动一个独立 Worker Pod 的简单策略。
 - Worker 使用预构建镜像，镜像内包含 Manim、Python、Node.js 和 Agent 运行环境。
-- Server 向 Worker 注入任务配置、模型配置、临时凭证和产物上传地址。
-- Server 监听 Worker 状态并同步任务进度。
-- 任务完成、失败或取消后，Server 负责清理 Worker 资源。
+- Server 向 Worker 注入 Project 快照、Thread 摘要、Run 配置、模型配置、临时凭证和产物上传地址。
+- Server 监听 Worker 状态并同步 Run Step、ToolCall、RenderJob 和预览进度。
+- Run 完成、失败或取消后，Server 根据策略保留或清理 Worker 资源。
 
 ### 5.4 持久化
 
 结构化数据存储在数据库中：
 
 - Project。
-- Project 内的用户消息和 Agent 消息。
+- Project Thread。
+- Project 内的用户消息、Assistant 消息、工具消息和系统消息。
+- AgentRun。
+- Run Step。
+- ToolCall。
+- RenderJob。
 - 用户请求。
-- 标准化后的任务输入。
-- 任务状态。
-- 阶段进度。
+- 标准化后的 Run 输入。
 - Agent 事件。
 - 预览版本。
 - Worker Git 提交元数据。
+- 渲染请求和渲染状态。
 - 错误摘要。
 - 产物引用。
 - 成本和资源指标。
@@ -195,33 +205,95 @@ Server 通过 Kubernetes 编排 Worker：
 - 审查报告。
 - Worker 完整结果包。
 
-### 5.5 Project、消息、任务和预览关系
+### 5.5 Project、Thread、Run、工具和预览关系
 
-Vibeo 后端应区分三个核心概念：
+Vibeo 后端应区分这些核心概念：
 
 - `Project`：用户可见的顶层资源，代表一个视频生成项目和它的完整工作区。
-- `ProjectMessage`：Project 内的用户消息、Agent 回复和系统消息。
-- `VideoJob`：一次实际生成、修改、渲染或审查任务。
-- `PreviewRevision`：任务过程中产生的可预览视频状态。
+- `ProjectThread`：Project 内持续存在的对话线程。
+- `ProjectMessage`：Thread 内的用户消息、Assistant 消息、工具消息和系统消息。
+- `AgentRun`：由一条用户消息触发的一次 Agent 执行过程。
+- `RunStep`：Run 内的可观察步骤，例如生成回复、调用工具、等待渲染或更新预览。
+- `ToolCall`：Agent 发起的具体工具调用，例如 `write_script`、`edit_manim_code`、`commit_workspace`、`review_video`。
+- `RenderJob`：系统发起的渲染任务，来源可以是 Git commit 自动触发，也可以是用户请求高质量渲染。
+- `PreviewRevision`：RenderJob 产生的可预览视频状态。
+- `WorkerGitCommit`：Worker Workspace 中与脚本和代码版本对应的 Git commit。
 
 关系：
 
 ```text
 Project
-  -> ProjectMessage[]
-  -> VideoJob[]
-      -> PreviewRevision[]
+  -> Workspace
       -> WorkerGitCommit[]
+  -> ProjectThread
+      -> ProjectMessage[]
+      -> AgentRun[]
+          -> RunStep[]
+              -> ToolCall[]
+  -> RenderJob[]
+      -> PreviewRevision[]
 ```
 
 设计要求：
 
 - 用户创建 `Project` 后即可发送消息与 Agent 对话。
-- 一个 `Project` 可以包含多个 `VideoJob`。
-- 一个 `VideoJob` 可以产生多个 `PreviewRevision`。
+- 一个用户消息最多有一个当前活跃 `AgentRun`，但一个 Project 可以包含多个历史 Run。
+- 一个 `AgentRun` 可以调用多个工具，也可以只回复文本而不修改视频。
+- 一个 `ToolCall` 可以修改 Workspace 并创建 Git commit。
+- 每个可运行的 `WorkerGitCommit` 都可以触发一个系统 `RenderJob`。
+- `RenderJob` 不属于 AgentRun 的工具调用；它是系统对 commit 或用户高质量渲染请求的响应。
+- 一个 `AgentRun` 可以通过 commit 间接产生多个 `PreviewRevision`。
 - 每个 `PreviewRevision` 必须关联 Worker Workspace 中的 Git commit。
 - 用户后续消息应能引用“当前预览”“上一个版本”或某个明确版本进行修改。
-- Server 不直接理解 Manim 源码细节，但必须保存版本、预览和 Project 消息之间的索引关系。
+- Server 不直接理解 Manim 源码细节，但必须保存消息、Run、工具调用、版本、预览和产物之间的索引关系。
+- 前端主要订阅 Project 事件流，而不是分别追踪多个底层任务。
+
+### 5.6 Thread 与消息模型
+
+Project Thread 是用户感知到的主界面状态。它不只是聊天文本历史，也包含 Assistant 的流式输出、工具摘要、预览引用和用户确认请求。
+
+消息角色：
+
+- `user`：用户输入。
+- `assistant`：General Agent 面向用户的回复。
+- `tool`：工具调用结果，默认用于 Agent 上下文，不直接完整展示给用户。
+- `system`：系统事件摘要，例如 Run 被取消、Worker 超时或产物上传完成。
+
+Assistant 消息可以由多个 content part 组成：
+
+```json
+{
+  "messageId": "msg_456",
+  "projectId": "proj_123",
+  "runId": "run_456",
+  "role": "assistant",
+  "status": "streaming",
+  "content": [
+    {
+      "type": "text",
+      "text": "我会先把这个主题拆成 4 个教学场景，然后生成一个快速预览。"
+    },
+    {
+      "type": "preview_ref",
+      "previewRevisionId": "preview_002"
+    },
+    {
+      "type": "artifact_ref",
+      "artifactType": "script",
+      "url": "https://storage.example/projects/proj_123/script.md"
+    }
+  ],
+  "createdAt": "2026-05-14T10:05:00.000Z"
+}
+```
+
+设计要求：
+
+- 前端应能只靠 Project Thread 和 Project 事件流恢复当前页面状态。
+- Assistant 文本必须支持增量追加。
+- 工具原始日志可以存储为 `tool` 消息或 artifact，但 Assistant 应生成适合用户阅读的摘要。
+- 当 Agent 需要用户确认时，应创建 `assistant` 消息，并将 Run 状态置为 `requires_user_input`。
+- 同一个 Project 默认只允许一个会修改 Workspace 的活跃 Run；纯解释型 Run 可以后续再考虑并发。
 
 ## 6. Worker 规格
 
@@ -229,14 +301,14 @@ Worker 是 Vibeo 的执行平面。Worker 在 Kubernetes 中运行，内部拥�
 
 ### 6.1 职责
 
-- 接收一个视频生成任务。
-- 初始化任务工作目录。
+- 接收一个 Project Run 或 ToolCall 执行请求。
+- 初始化或恢复 Project Workspace。
 - 将 Workspace 初始化为 Git 仓库。
 - 运行 General、Writer、Programmer、Reviewer 等 Agent。
-- 执行 Manim 渲染命令。
+- 执行系统 RenderJob 中的 Manim 渲染命令。
 - 按秒抽取视频截图。
 - 在关键阶段生成可预览产物。
-- 为脚本、代码、渲染和审查结果创建 Git checkpoint。
+- 为脚本和代码变更创建 Git checkpoint。
 - 上传脚本、源码、日志、截图、审查报告和最终视频。
 - 向 Server 持续发送结构化事件。
 - 在失败时返回明确的错误信息。
@@ -263,7 +335,8 @@ Worker 镜像应包含：
 
 最低隔离要求：
 
-- 每个任务拥有独立工作目录。
+- 每个 Project 拥有独立 Workspace；MVP 如果按 Run 启动 Worker，也应为每个 Run 准备隔离工作目录。
+- 如果同一 Project 的多个 Run 复用 Worker，必须保证同一时间只有一个会修改 Workspace 的 ToolCall 处于活动状态。
 - 默认使用临时文件系统。
 - 禁止特权容器。
 - 限制 CPU 和内存。
@@ -281,10 +354,10 @@ Worker 中的 Workspace 必须使用 Git 进行版本管理。Git 是后端实�
 要求：
 
 - Worker 启动后在 Workspace 中初始化 Git 仓库。
-- 每个任务的初始输入写入后创建初始 commit。
+- 每个 Project 的初始输入写入后创建初始 commit。
 - Writer 生成或修改脚本后创建 commit。
 - Programmer 每次完成一轮可运行代码后创建 commit。
-- Reviewer 每次渲染尝试和审查报告完成后创建 commit。
+- Agent 不应通过直接调用渲染工具来生成预览；Agent 应通过 `commit_workspace` 创建可运行 commit，由系统自动触发预览 RenderJob。
 - 每个 `PreviewRevision` 必须指向一个明确的 commit SHA。
 - 进入修正循环前应保留 Reviewer 拒绝时对应的 commit。
 - Worker 上传产物时应包含源码快照和 Git 元数据。
@@ -296,11 +369,8 @@ Worker 中的 Workspace 必须使用 Git 进行版本管理。Git 是后端实�
 init: create job workspace
 script: add initial video script
 code: implement scene_01_to_scene_04
-render: add attempt-1 preview artifacts
-review: reject attempt-1 with major issues
 code: fix missing complexity scene
-render: add attempt-2 approved video
-review: approve final result
+code: adjust layout after preview review
 ```
 
 Worker 不应把 `.git` 目录作为普通源码目录直接暴露给用户。对外产物可以使用：
@@ -312,21 +382,43 @@ Worker 不应把 `.git` 目录作为普通源码目录直接暴露给用户。�
 
 ### 6.5 实时预览产物
 
-Manim 渲染并不天然等同于逐帧直播，因此 Vibeo 的“实时预览”应定义为：Worker 在生成过程中尽早、持续地产生可被前端播放或展示的中间结果。
+Manim 渲染并不天然等同于逐帧直播，因此 Vibeo 的“实时预览”应定义为：系统在 Agent 产生可运行 Git commit 后，自动启动快速 RenderJob，并尽早、持续地产生可被前端播放或展示的中间结果。
 
 预览类型：
 
 - `frame`：单张关键帧或按秒抽取的截图。
 - `scene_clip`：某个场景的低质量短片段。
-- `attempt_video`：某次完整渲染尝试的视频。
-- `final_video`：通过 Reviewer 的最终视频。
+- `preview_video`：基于某个 commit 的低质量完整预览。
+- `final_video`：用户手动触发的高质量最终视频。
 
 要求：
 
-- Worker 在预览可用后立即上传产物并发送事件。
-- 每个预览必须包含 `previewRevisionId`、`jobId`、`commitSha`、`type`、`url` 和生成时间。
-- 预览可以是低质量快速渲染，但最终视频必须使用任务要求的质量配置。
+- 每个可运行 commit 默认触发一个快速预览 RenderJob。
+- RenderJob 在预览可用后立即上传产物并发送事件。
+- 每个预览必须包含 `previewRevisionId`、`projectId`、`runId`、`commitSha`、`renderJobId`、`type`、`url` 和生成时间。
+- 预览可以是低质量快速渲染，但最终高质量视频必须由用户显式触发。
 - 后续用户消息默认基于最新已确认的预览版本，除非用户明确指定其他版本。
+
+### 6.6 Commit 触发渲染
+
+Git commit 是 Vibeo 后端触发渲染的版本边界。
+
+触发规则：
+
+- `commit_workspace` 工具成功创建 commit 后，Worker 必须发送 `workspace.commit.created` 事件。
+- Server 收到 commit 事件后，应判断该 commit 是否可渲染。
+- 可渲染 commit 自动创建一个 `RenderJob`，默认类型为 `preview`。
+- `preview` RenderJob 使用快速、低成本配置，目标是尽快给用户反馈。
+- 渲染产物、抽帧截图和日志不应写回被 Agent 管理的 Git Workspace，以免产生渲染-提交-再渲染循环。
+- 同一个 commit 的 preview RenderJob 应具备幂等性，重复事件不应产生重复渲染。
+- 如果 commit 渲染失败，Server 应把失败事件写入 Project Thread，并允许 Agent 在下一轮读取失败摘要后修复。
+
+用户高质量渲染：
+
+- 用户认为当前预览效果不错时，可以基于 `previewRevisionId` 或 `commitSha` 触发 `final` RenderJob。
+- `final` RenderJob 不创建 AgentRun，不调用 General、Writer、Programmer 或 Reviewer。
+- `final` RenderJob 使用高质量配置，并产出最终视频。
+- 高质量渲染完成后，Server 将最终视频关联到 Project，并通过 Project 事件流通知前端。
 
 ## 7. Agent 规格
 
@@ -351,6 +443,8 @@ General 不直接执行文件编辑、代码运行或视频渲染。它的主要
 - 在审查失败时判断是否进入修正循环。
 - 在重试次数耗尽时终止任务并给出失败原因。
 - 保证所有 Agent 的输出始终对齐原始用户需求。
+- 以 Assistant 的身份向用户流式回复当前进展、选择依据和最终结果。
+- 将 Writer、Programmer 和 Reviewer 暴露为可调用工具，而不是让用户直接调用这些内部 Agent。
 
 ### 7.2 Writer Agent
 
@@ -396,14 +490,12 @@ Programmer 应优先生成清楚、稳定、可复现的代码，而不是过度
 
 ### 7.4 Reviewer Agent
 
-Reviewer 是质量门禁，负责渲染和审查最终视频是否符合脚本。
+Reviewer 是质量门禁，负责审查系统 RenderJob 生成的视频是否符合脚本。
 
 职责：
 
-- 执行 Manim 渲染。
-- 保存渲染日志。
-- 每秒抽取一张截图。
-- 检查渲染是否成功。
+- 读取 RenderJob 的视频、渲染日志和抽帧截图。
+- 检查渲染结果是否可用。
 - 对照原始脚本审查视频内容。
 - 发现缺失场景、画面错位、文本溢出、时序不合理、视觉表达错误等问题。
 - 输出结构化审查报告。
@@ -416,52 +508,84 @@ Reviewer 是质量门禁，负责渲染和审查最终视频是否符合脚本�
 - 渲染日志。
 - 通过、带警告通过或拒绝结果。
 
-任务不应在 Reviewer 拒绝后被标记为 `completed`，除非用户或系统策略明确允许“带警告完成”。
+Reviewer 拒绝后，当前 Run 不应发布最终完成结果，除非用户或系统策略明确允许“带警告完成”。
+
+### 7.5 Agent 工具模型
+
+类 ChatGPT 的工作流中，用户只感知到一个正在工作的 Assistant。内部专业 Agent 应作为工具能力被 General 调用。
+
+MVP 工具集合：
+
+- `write_script`：调用 Writer 生成或修改 `script.json` 和 `script.md`。
+- `edit_manim_code`：调用 Programmer 生成或修改 Manim Python 代码。
+- `commit_workspace`：保存 Worker Workspace Git checkpoint，并触发系统自动预览渲染。
+- `review_video`：调用 Reviewer 对已有 RenderJob 结果进行抽帧审查。
+- `publish_artifact`：上传源码、审查报告或其他非渲染产物。
+
+工具调用要求：
+
+- 每次工具调用必须有 `toolCallId`、`runId`、`projectId`、输入摘要、状态、开始时间和结束时间。
+- 长耗时工具必须持续发送进度事件。
+- 工具结果应作为 Thread 中的工具消息落库，但默认不直接暴露完整原始日志给用户。
+- Assistant 回复用户时应引用工具结果的摘要、预览链接和需要用户确认的事项。
+- 如果工具失败，Run 不应立即丢失上下文；General 应先尝试解释问题、修复或向用户请求下一步。
 
 ## 8. 生成流程
 
-### 8.1 正常流程
+### 8.1 类 ChatGPT AgentRun 流程
 
 ```text
 1. Client 创建或打开一个 Project。
 2. Client 在 Project 内发送用户消息，请求生成或修改视频。
-3. Server 保存消息并创建 VideoJob。
-4. Server 启动 Worker。
-5. Worker 初始化 Git Workspace 并创建初始 commit。
-6. General 理解任务并制定计划。
-7. General 调用 Writer。
-8. Writer 生成结构化视频脚本并提交 commit。
-9. General 调用 Programmer。
-10. Programmer 编写 Manim 代码并提交 commit。
-11. General 调用 Reviewer。
-12. Reviewer 渲染视频。
-13. Reviewer 生成预览产物并提交 commit。
-14. Reviewer 每秒抽取截图。
-15. Reviewer 对照脚本审查视频。
-16. 审查通过后 Worker 上传所有产物。
-17. Server 标记任务 completed。
-18. Client 获取最终视频、预览版本和产物链接。
+3. Server 保存用户消息并创建 AgentRun。
+4. Client 订阅 Project 事件流，开始接收 Run 事件。
+5. General 读取 Project Thread、当前预览、当前 Git commit 和用户新消息。
+6. General 先流式回复正在理解需求，并生成可展示的简短计划。
+7. General 按需调用工具：write_script、edit_manim_code、commit_workspace、review_video。
+8. 每个工具调用都作为 RunStep 进入事件流，并持续上报状态。
+9. Worker 在工具执行过程中更新 Workspace，并通过 commit_workspace 创建 Git commit。
+10. Server 收到 commit 事件后自动创建 preview RenderJob。
+11. RenderJob 完成快速渲染、抽帧并上传预览产物。
+12. Server 将预览、RenderJob 和 commit 事件推送给 Client。
+13. General 根据预览和审查结果继续回复、继续调用工具，或请求用户确认。
+14. 当预览达到可接受状态时，General 发布 Assistant 消息，提示用户可以触发高质量渲染。
+15. 用户点击高质量渲染按钮后，Server 基于选定 commit 创建 final RenderJob。
+16. final RenderJob 完成后，Server 将最终视频关联到 Project。
 ```
 
-### 8.2 修正循环
+### 8.2 工具调用与修正循环
 
 当 Reviewer 发现可修复问题时进入修正循环：
 
 ```text
-Reviewer 生成问题报告
-  -> General 判断是否继续修正
-  -> Programmer 根据报告修改代码
-  -> Reviewer 重新渲染和审查
-  -> 直到通过或达到最大修正次数
+review_video 工具返回问题报告
+  -> General 向用户流式说明正在修正
+  -> edit_manim_code 工具根据报告修改代码
+  -> commit_workspace 工具创建 checkpoint
+  -> 系统自动创建 preview RenderJob
+  -> review_video 工具基于新的 RenderJob 结果重新审查
+  -> General 总结结果或继续下一轮
 ```
 
 MVP 默认最多修正 3 次。
 
-### 8.3 失败处理
+### 8.3 用户打断与继续
+
+类 ChatGPT 体验必须允许用户在当前 Run 之后继续追问，也应支持停止当前 Run。
+
+要求：
+
+- 用户可以取消正在运行的 `AgentRun`。
+- 取消 Run 时，Server 应终止正在执行的 Worker ToolCall 或将其标记为可丢弃。
+- 已经产生的消息、预览和 Git commit 不应丢失。
+- 用户发送下一条消息时，新的 Run 默认基于 Project 最新稳定版本继续。
+- 如果上一轮在工具调用中失败，General 应能在下一轮读取失败摘要并继续修复。
+
+### 8.4 失败处理
 
 每次失败都必须包含：
 
-- 失败阶段。
+- 失败 Run Step 或 ToolCall。
 - 错误码。
 - 面向用户的摘要。
 - 面向开发者的详细日志。
@@ -487,7 +611,7 @@ MVP 默认最多修正 3 次。
 POST /v1/projects
 ```
 
-创建一个可持续上下文的视频生成项目。创建成功后，用户即可在该 Project 内发送消息与 Agent 对话。后续用户消息、Agent 回复、视频任务、预览版本、Git 版本和最终产物都归属于该 Project。
+创建一个可持续上下文的视频生成项目。创建成功后，用户即可在该 Project 内发送消息与 Agent 对话。后续用户消息、Agent 回复、AgentRun、预览版本、Git 版本和最终产物都归属于该 Project。
 
 请求示例：
 
@@ -505,12 +629,12 @@ POST /v1/projects
   "projectId": "proj_123",
   "title": "二分查找教学视频",
   "initialMessageId": "msg_001",
-  "initialJobId": "job_001",
+  "initialRunId": "run_001",
   "createdAt": "2026-05-14T10:00:00.000Z"
 }
 ```
 
-`initialMessage` 可选。如果创建 Project 时提供 `initialMessage`，Server 应同时创建第一条用户消息，并可立即创建对应的 `VideoJob`。
+`initialMessage` 可选。如果创建 Project 时提供 `initialMessage`，Server 应同时创建第一条用户消息，并可立即创建对应的 `AgentRun`。
 
 ### 9.2 发送 Project 消息
 
@@ -518,7 +642,7 @@ POST /v1/projects
 POST /v1/projects/{projectId}/messages
 ```
 
-用户在 Project 内发送一条消息。Server 根据消息内容创建新的 `VideoJob`，或让 Worker 基于当前视频版本执行修改、重新渲染、解释或审查。
+用户在 Project 内发送一条消息。Server 根据消息内容创建新的 `AgentRun`。AgentRun 可以只回复文本，也可以调用工具修改视频、重新渲染、解释或审查当前结果。
 
 请求示例：
 
@@ -535,7 +659,7 @@ POST /v1/projects/{projectId}/messages
 {
   "messageId": "msg_123",
   "projectId": "proj_123",
-  "jobId": "job_456",
+  "runId": "run_456",
   "status": "queued"
 }
 ```
@@ -546,15 +670,105 @@ POST /v1/projects/{projectId}/messages
 GET /v1/projects/{projectId}/events
 ```
 
-面向 ChatGPT 式体验的主事件流。MVP 使用 SSE 即可。事件包括用户消息确认、Agent 增量回复、任务阶段、工具调用、预览更新、Git checkpoint、错误和完成通知。
+面向 ChatGPT 式体验的主事件流。MVP 使用 SSE 即可。事件包括用户消息确认、Assistant 增量回复、Run Step、工具调用、预览更新、Git checkpoint、错误和完成通知。
 
-### 9.4 创建视频任务
+### 9.4 查询 AgentRun
+
+```http
+GET /v1/projects/{projectId}/runs/{runId}
+```
+
+响应示例：
+
+```json
+{
+  "runId": "run_456",
+  "projectId": "proj_123",
+  "triggerMessageId": "msg_123",
+  "status": "waiting_for_tool",
+  "currentStep": {
+    "runStepId": "step_003",
+    "type": "tool_call",
+    "toolName": "commit_workspace",
+    "status": "running"
+  },
+  "latestPreviewRevisionId": "preview_123",
+  "latestCommitSha": "8f4b7c1",
+  "createdAt": "2026-05-14T10:00:00.000Z",
+  "updatedAt": "2026-05-14T10:08:30.000Z"
+}
+```
+
+### 9.5 取消 AgentRun
+
+```http
+POST /v1/projects/{projectId}/runs/{runId}/cancel
+```
+
+Server 应停止当前 Run，并取消或终止正在执行的 Worker ToolCall。
+
+### 9.6 触发高质量渲染
+
+```http
+POST /v1/projects/{projectId}/renders
+```
+
+用户确认某个预览效果不错后，前端调用该接口触发高质量渲染。该接口不创建 `AgentRun`，不经过 General Agent，也不会调用 Writer、Programmer 或 Reviewer。
+
+请求示例：
+
+```json
+{
+  "source": {
+    "previewRevisionId": "preview_123",
+    "commitSha": "8f4b7c1"
+  },
+  "quality": "high_quality",
+  "format": "mp4"
+}
+```
+
+响应示例：
+
+```json
+{
+  "renderJobId": "render_789",
+  "projectId": "proj_123",
+  "type": "final",
+  "status": "queued",
+  "commitSha": "8f4b7c1"
+}
+```
+
+### 9.7 查询 RenderJob
+
+```http
+GET /v1/projects/{projectId}/renders/{renderJobId}
+```
+
+响应示例：
+
+```json
+{
+  "renderJobId": "render_789",
+  "projectId": "proj_123",
+  "type": "final",
+  "status": "running",
+  "quality": "high_quality",
+  "commitSha": "8f4b7c1",
+  "progress": 0.42,
+  "createdAt": "2026-05-14T10:12:00.000Z",
+  "updatedAt": "2026-05-14T10:13:20.000Z"
+}
+```
+
+### 9.8 创建内部视频任务
 
 ```http
 POST /v1/videos
 ```
 
-该接口用于不经过消息流的直接任务创建，或作为内部兼容接口。面向最终产品体验时，优先通过 Project 消息创建任务。
+该接口用于不经过 Project Thread 的直接任务创建，主要作为内部调试或兼容接口。面向最终产品体验时，前端不应直接调用该接口，而应通过 Project 消息创建 AgentRun。MVP 可以不公开该接口。
 
 请求示例：
 
@@ -602,7 +816,7 @@ MVP 可选字段：
 }
 ```
 
-### 9.5 查询任务
+### 9.9 查询内部视频任务
 
 ```http
 GET /v1/videos/{jobId}
@@ -624,31 +838,32 @@ GET /v1/videos/{jobId}
 }
 ```
 
-### 9.6 订阅任务事件
+### 9.10 订阅内部视频任务事件
 
 ```http
 GET /v1/videos/{jobId}/events
 ```
 
-MVP 使用 SSE 即可。事件包括阶段变化、Agent 消息、工具调用、渲染进度、预览更新、Git checkpoint、上传进度、警告和错误。
+该接口用于内部调试。产品前端应优先订阅 Project 事件流。
 
-### 9.7 查询预览版本
+### 9.11 查询 Project 预览版本
 
 ```http
-GET /v1/videos/{jobId}/previews
+GET /v1/projects/{projectId}/previews
 ```
 
 响应示例：
 
 ```json
 {
-  "jobId": "job_123",
   "projectId": "proj_123",
   "previews": [
     {
       "previewRevisionId": "preview_123",
-      "type": "attempt_video",
-      "url": "https://storage.example/jobs/job_123/previews/attempt-1.mp4",
+      "runId": "run_456",
+      "renderJobId": "render_123",
+      "type": "preview_video",
+      "url": "https://storage.example/projects/proj_123/previews/preview-123/preview.mp4",
       "commitSha": "8f4b7c1",
       "status": "available",
       "createdAt": "2026-05-14T10:08:00.000Z"
@@ -657,7 +872,7 @@ GET /v1/videos/{jobId}/previews
 }
 ```
 
-### 9.8 取消任务
+### 9.12 取消内部视频任务
 
 ```http
 POST /v1/videos/{jobId}/cancel
@@ -665,7 +880,7 @@ POST /v1/videos/{jobId}/cancel
 
 Server 应停止对应 Worker，并将任务标记为 `cancelled`。
 
-### 9.9 重试任务
+### 9.13 重试内部视频任务
 
 ```http
 POST /v1/videos/{jobId}/retry
@@ -673,16 +888,17 @@ POST /v1/videos/{jobId}/retry
 
 MVP 可以从头重试。后续版本可支持从最近的安全检查点重试，例如从脚本、源码或渲染阶段继续。
 
-## 10. 输入模型
+## 10. Run 输入模型
 
-标准化后的任务输入：
+标准化后的 AgentRun 输入：
 
 ```json
 {
-  "jobId": "job_123",
   "projectId": "proj_123",
+  "runId": "run_456",
   "messageId": "msg_123",
   "basePreviewRevisionId": "preview_001",
+  "baseCommitSha": "8f4b7c1",
   "topic": "用动画解释二分查找",
   "audience": "初学编程的学生",
   "language": "zh-CN",
@@ -701,33 +917,33 @@ MVP 可以从头重试。后续版本可支持从最近的安全检查点重试�
 }
 ```
 
-## 11. 输出模型
+## 11. Run 输出模型
 
-任务完成后的结果：
+AgentRun 完成后的结果：
 
 ```json
 {
-  "jobId": "job_123",
   "projectId": "proj_123",
+  "runId": "run_456",
   "status": "completed",
   "latestPreviewRevisionId": "preview_003",
   "latestCommitSha": "f13a9de",
   "video": {
-    "url": "https://storage.example/jobs/job_123/final.mp4",
+    "url": "https://storage.example/projects/proj_123/final.mp4",
     "durationSeconds": 92,
     "resolution": "1280x720",
     "format": "mp4"
   },
   "artifacts": {
-    "scriptJsonUrl": "https://storage.example/jobs/job_123/script.json",
-    "scriptMarkdownUrl": "https://storage.example/jobs/job_123/script.md",
-    "sourceArchiveUrl": "https://storage.example/jobs/job_123/source.zip",
-    "workspaceBundleUrl": "https://storage.example/jobs/job_123/workspace.bundle",
-    "commitsJsonUrl": "https://storage.example/jobs/job_123/commits.json",
-    "previewsUrl": "https://storage.example/jobs/job_123/previews.json",
-    "reviewReportUrl": "https://storage.example/jobs/job_123/review.json",
-    "framesUrl": "https://storage.example/jobs/job_123/frames.zip",
-    "logsUrl": "https://storage.example/jobs/job_123/logs.txt"
+    "scriptJsonUrl": "https://storage.example/projects/proj_123/script.json",
+    "scriptMarkdownUrl": "https://storage.example/projects/proj_123/script.md",
+    "sourceArchiveUrl": "https://storage.example/projects/proj_123/source.zip",
+    "workspaceBundleUrl": "https://storage.example/projects/proj_123/workspace.bundle",
+    "commitsJsonUrl": "https://storage.example/projects/proj_123/commits.json",
+    "previewsUrl": "https://storage.example/projects/proj_123/previews.json",
+    "reviewReportUrl": "https://storage.example/projects/proj_123/review.json",
+    "framesUrl": "https://storage.example/projects/proj_123/frames.zip",
+    "logsUrl": "https://storage.example/projects/proj_123/runs/run_456/logs.txt"
   },
   "warnings": []
 }
@@ -735,10 +951,10 @@ MVP 可以从头重试。后续版本可支持从最近的安全检查点重试�
 
 ## 12. 产物目录
 
-每个任务应生成独立产物目录：
+每个 Project 应有持续产物目录；每个 Run 的中间产物放在独立子目录中：
 
 ```text
-jobs/{jobId}/
+projects/{projectId}/
   input.json
   messages.json
   script.json
@@ -759,18 +975,26 @@ jobs/{jobId}/
     preview-002/
       clip.mp4
       metadata.json
-  render/
-    attempt-1/
-      final.mp4
+  renders/
+    render-001-preview/
+      preview.mp4
+      frames/
       logs.txt
-    attempt-2/
+      metadata.json
+    render-002-final/
       final.mp4
+      frames/
       logs.txt
-    final.mp4
+      metadata.json
   frames/
     000000.png
     000001.png
     000002.png
+  runs/
+    run-001/
+      events.jsonl
+      tool-calls.json
+      logs.txt
   review.json
   result.json
 ```
@@ -875,34 +1099,74 @@ MVP 渲染目标：
 渲染尝试应分开保存：
 
 ```text
-render/attempt-1/
-render/attempt-2/
-render/final.mp4
+renders/
+  render-001-preview/
+  render-002-preview/
+  render-003-final/
+final.mp4
 ```
+
+### 15.1 RenderJob 状态机
+
+RenderJob 是系统渲染任务，不属于 AgentRun。
+
+```text
+queued
+  -> running
+  -> extracting_frames
+  -> uploading
+  -> completed
+
+failed
+cancelled
+expired
+```
+
+RenderJob 类型：
+
+- `preview`：由 Git commit 自动触发，使用低质量快速配置。
+- `final`：由用户显式触发，使用高质量配置。
+
+设计要求：
+
+- `preview` RenderJob 必须关联 `commitSha` 和触发该 commit 的 `runId`。
+- `final` RenderJob 必须关联 `commitSha`，可以选择性关联用户选中的 `previewRevisionId`。
+- `final` RenderJob 不应创建 AgentRun。
+- 同一 commit 可以有多个 final RenderJob，但应避免无意义的并发重复渲染。
+- RenderJob 事件必须进入 Project 事件流。
 
 ## 16. 事件与可观测性
 
-每个任务都应产生结构化事件：
+每个 Project 和 AgentRun 都应产生结构化事件：
 
 - `project.created`
 - `message.created`
 - `message.delta`
-- `job.created`
-- `job.queued`
+- `run.created`
+- `run.queued`
+- `run.in_progress`
+- `run.step.created`
+- `run.step.delta`
+- `run.step.completed`
 - `worker.started`
-- `phase.started`
-- `phase.completed`
 - `agent.started`
 - `agent.message`
-- `tool.started`
-- `tool.completed`
+- `tool_call.created`
+- `tool_call.delta`
+- `tool_call.completed`
+- `tool_call.failed`
 - `workspace.commit.created`
+- `render_job.created`
+- `render_job.started`
+- `render_job.progress`
+- `render_job.completed`
+- `render_job.failed`
 - `preview.created`
 - `preview.available`
 - `artifact.uploaded`
-- `job.completed`
-- `job.failed`
-- `job.cancelled`
+- `run.completed`
+- `run.failed`
+- `run.cancelled`
 
 事件字段：
 
@@ -910,9 +1174,10 @@ render/final.mp4
 {
   "eventId": "evt_123",
   "projectId": "proj_123",
-  "jobId": "job_123",
+  "runId": "run_456",
+  "runStepId": "step_002",
   "type": "agent.message",
-  "phase": "programming",
+  "stepType": "assistant_message",
   "agent": "Programmer",
   "severity": "info",
   "message": "Created initial Manim scene implementation.",
@@ -927,18 +1192,39 @@ render/final.mp4
 {
   "eventId": "evt_456",
   "projectId": "proj_123",
-  "jobId": "job_123",
+  "runId": "run_456",
+  "toolCallId": "tool_789",
   "type": "preview.available",
-  "phase": "rendering",
+  "stepType": "tool_call",
   "severity": "info",
   "message": "A new low-quality preview is available.",
   "payload": {
     "previewRevisionId": "preview_002",
-    "previewType": "attempt_video",
+    "renderJobId": "render_123",
+    "previewType": "preview_video",
     "commitSha": "8f4b7c1",
-    "url": "https://storage.example/jobs/job_123/previews/preview-002/clip.mp4"
+    "url": "https://storage.example/projects/proj_123/previews/preview-002/clip.mp4"
   },
   "createdAt": "2026-05-14T10:08:00.000Z"
+}
+```
+
+高质量渲染事件示例：
+
+```json
+{
+  "eventId": "evt_789",
+  "projectId": "proj_123",
+  "renderJobId": "render_789",
+  "type": "render_job.completed",
+  "severity": "info",
+  "message": "High-quality render completed.",
+  "payload": {
+    "renderType": "final",
+    "commitSha": "8f4b7c1",
+    "videoUrl": "https://storage.example/projects/proj_123/final.mp4"
+  },
+  "createdAt": "2026-05-14T10:20:00.000Z"
 }
 ```
 
@@ -952,7 +1238,7 @@ Vibeo 的安全核心是：Agent 生成的代码必须只在隔离 Worker 内执
 - Worker 不使用特权容器。
 - Worker 不挂载宿主机敏感目录。
 - Worker 不直接访问数据库。
-- Worker 只获得单任务临时凭证。
+- Worker 只获得单 Project 或单 Run 的临时凭证。
 - 产物上传凭证必须短期有效。
 - 网络访问使用 allowlist。
 - 日志中不得泄露 API Key、对象存储凭证或内部 Token。
@@ -982,7 +1268,9 @@ Vibeo 的安全核心是：Agent 生成的代码必须只在隔离 Worker 内执
   "render": {
     "quality": "medium_quality",
     "renderer": "cairo",
-    "frameSampleIntervalSeconds": 1
+    "frameSampleIntervalSeconds": 1,
+    "autoPreviewOnCommit": true,
+    "finalQuality": "high_quality"
   },
   "preview": {
     "enabled": true,
@@ -999,17 +1287,21 @@ MVP 必须包含：
 
 - 创建 Project API。
 - 发送 Project 消息 API。
-- 创建视频任务 API。
-- 查询任务 API。
-- SSE Project 事件流和任务事件流。
-- 每个任务启动一个 Worker。
+- 创建和查询 AgentRun。
+- 取消 AgentRun。
+- 用户触发高质量 RenderJob。
+- SSE Project 事件流。
+- 每个 Run 启动一个 Worker，或每个 Project 复用一个活跃 Worker。
 - Worker Workspace Git checkpoint。
+- Git commit 自动触发低质量预览 RenderJob。
 - General、Writer、Programmer、Reviewer 四类 Agent。
+- General 以单一 Assistant 身份与用户对话，并通过工具调用其他 Agent。
+- Run Step 和 ToolCall 事件模型。
 - Writer 生成结构化脚本。
 - Programmer 生成 Manim Python 代码。
-- Reviewer 渲染 Manim 视频。
+- RenderJob 渲染 Manim 视频。
 - 预览版本模型和至少一种可实时展示的预览产物。
-- Reviewer 每秒抽帧并审查。
+- RenderJob 每秒抽帧，Reviewer 基于抽帧结果审查。
 - 最多 3 次自动修正循环。
 - 上传最终视频和主要产物。
 - 上传 Git commit 元数据。
@@ -1035,14 +1327,14 @@ MVP 可以暂缓：
 - `workspaces/worker/src/agents/general`：General Agent 骨架。
 - `workspaces/worker/src/agents/programmer`：Programmer Agent 骨架。
 - `workspaces/worker/src/config`：Agent 模型配置结构。
-- `workspaces/worker/container/Dockerfile`：当前已在 `/workspace` 初始化 Git 仓库，可继续扩展为任务级 Git checkpoint 机制。
+- `workspaces/worker/container/Dockerfile`：当前已在 `/workspace` 初始化 Git 仓库，可继续扩展为 Project/Run 级 Git checkpoint 机制。
 
 后续需要补齐：
 
 - Writer Agent。
 - Reviewer Agent。
 - Server API。
-- Worker 任务入口协议。
+- Worker Run 和 ToolCall 入口协议。
 - Kubernetes 编排逻辑。
 - 事件流。
 - 产物上传。
