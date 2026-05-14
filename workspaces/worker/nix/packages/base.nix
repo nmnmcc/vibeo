@@ -16,6 +16,8 @@ in
   pkgs.git
   pkgs.glib
   pkgs.harfbuzz
+  pkgs.meson
+  pkgs.ninja
   pkgs.nodejs
   pkgs.pango
   pkgs.pkg-config
