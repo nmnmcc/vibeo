@@ -1,0 +1,70 @@
+---
+title: コンテキスト管理
+description: Learn how to provide local data via RunContext and expose context to the LLM
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import localContextExample from '../../../../../../examples/docs/context/localContext.ts?raw';
+
+コンテキストは多義的な用語です。関心を持つ可能性のあるコンテキストには、大きく 2 つの種類があります。
+
+1. **ローカルコンテキスト**: 実行中にコードからアクセスできるものです。ツールに必要な依存関係やデータ、`onHandoff` のようなコールバック、ライフサイクルフックが含まれます。
+2. **エージェント / LLM コンテキスト**: レスポンス生成時に言語モデルが参照できるものです。
+
+## ローカルコンテキスト
+
+ローカルコンテキストは `RunContext<T>` 型で表されます。状態や依存関係を保持する任意のオブジェクトを作成し、それを `Runner.run()` に渡します。すべてのツール呼び出しとフックは `RunContext` ラッパーを受け取り、そのオブジェクトを読み取ったり変更したりできます。
+
+<Code
+  lang="typescript"
+  code={localContextExample}
+  title="ローカルコンテキストの例"
+/>
+
+1 回の実行に参加するすべてのエージェント、ツール、フックは、同じコンテキストの **型** を使用する必要があります。
+
+ローカルコンテキストは、次のような用途に使用します。
+
+- 実行に関するデータ（ユーザー名、ID など）
+- ロガーやデータフェッチャーなどの依存関係
+- ヘルパー関数
+
+<Aside type="note">
+  コンテキストオブジェクトは LLM に送信されることは
+  **ありません**。これは完全にローカルなもので、自由に 読み書きできます。
+</Aside>
+
+1 回の実行内では、派生コンテキストは同じ基盤となるアプリコンテキスト、承認、使用状況トラッキングを共有します。ネストされた `agent.asTool()` の実行では別の `toolInput` が添付される場合がありますが、デフォルトではアプリ状態の分離されたコピーは取得しません。
+
+### `RunContext` の公開内容
+
+`RunContext<T>` は、アプリで定義したコンテキストオブジェクトのラッパーです。実際には、ほとんどの場合、次のものを使用します。
+
+- `runContext.context` は、独自の可変アプリ状態と依存関係に使用します。
+- `runContext.usage` は、現在の実行における集約されたトークン / リクエスト使用量に使用します。
+- `runContext.toolInput` は、現在の実行が `agent.asTool()` の内部で実行されている場合の構造化入力に使用します。
+- `runContext.approveTool(...)` / `runContext.rejectTool(...)` は、承認状態をプログラムで更新する必要がある場合に使用します。
+
+`runContext.context` だけがアプリで定義したオブジェクトです。他のフィールドは SDK が管理するランタイムメタデータです。
+
+あとで [人間の介入（HITL）](/openai-agents-js/ja/guides/human-in-the-loop) のために [`RunState`](/openai-agents-js/ja/guides/results#state) をシリアライズする場合、そのランタイムメタデータも状態とともに保存されます。シリアライズした状態を永続化または送信する予定がある場合は、`runContext.context` にシークレットを入れないでください。
+
+<Aside type="note">
+  `RunContext`
+  は現在の実行におけるローカルなアプリ状態に関するものです。会話状態は
+  別の関心事です。ターンをどのように引き継ぐかに応じて、`result.history`、`session`、`conversationId`、または
+  `previousResponseId` を使用します。その判断については
+  [エージェントの実行](/openai-agents-js/ja/guides/running-agents#state-and-conversation-management)
+  を参照してください。
+</Aside>
+
+`RunContext` をサブクラス化する場合は、ネストされた実行や派生実行でも、依存しているサブクラス固有のインスタンス状態が引き続き保持されることを確認してください。SDK はネストされた実行中に内部でフォークされたコンテキストを作成します。
+
+## エージェント / LLM コンテキスト
+
+LLM が呼び出されるとき、LLM が参照できるデータは会話履歴から来るものだけです。追加情報を利用可能にするには、いくつかの選択肢があります。
+
+1. エージェントの `instructions` に追加します。これはシステムメッセージまたは開発者メッセージとも呼ばれます。静的な文字列でも、コンテキストを受け取って文字列を返す関数でもかまいません。
+2. `Runner.run()` を呼び出すときに `input` に含めます。これは instructions の手法に似ていますが、メッセージを [指揮系統（chain of command）](https://cdn.openai.com/spec/model-spec-2024-05-08.html#follow-the-chain-of-command) のより低い位置に配置できます。
+3. LLM が必要に応じてデータを取得できるように、関数ツール経由で公開します。
+4. ファイル、データベース、または Web からの関連データに基づいて応答できるように、取得や Web 検索ツールを使用します。

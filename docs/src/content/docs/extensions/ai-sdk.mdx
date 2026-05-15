@@ -1,0 +1,154 @@
+---
+title: AI SDK Integration
+description: Connect your Agents SDK agents to any model through Vercel's AI SDK
+---
+
+import { Steps, Code } from '@astrojs/starlight/components';
+import aiSdkImportsExample from '../../../../../examples/docs/extensions/ai-sdk-imports.ts?raw';
+import aiSdkModelExample from '../../../../../examples/docs/extensions/ai-sdk-model.ts?raw';
+import aiSdkProviderDataExample from '../../../../../examples/docs/extensions/ai-sdk-providerData.ts?raw';
+import aiSdkProviderMetadataExample from '../../../../../examples/docs/extensions/ai-sdk-providerMetadata.ts?raw';
+import aiSdkSetupExample from '../../../../../examples/docs/extensions/ai-sdk-setup.ts?raw';
+import aiSdkTransformOutputTextExample from '../../../../../examples/docs/extensions/ai-sdk-transform-output-text.ts?raw';
+import aiSdkUiMessageStreamExample from '../../../../../examples/docs/extensions/ai-sdk-ui-message-stream.ts?raw';
+import aiSdkUiMessageStreamResponseExample from '../../../../../examples/docs/extensions/ai-sdk-ui-message-stream-response.ts?raw';
+import aiSdkTextStreamResponseExample from '../../../../../examples/docs/extensions/ai-sdk-text-stream-response.ts?raw';
+
+Out of the box the Agents SDK works with OpenAI models through the Responses API or Chat Completions API. However, if you would like to use another model, the [Vercel AI SDK](https://sdk.vercel.ai/) offers a range of supported models that can be brought into the Agents SDK through this adapter.
+
+## Setup
+
+<Steps>
+
+1. Install the AI SDK adapter by installing the extensions package:
+
+   ```bash
+   npm install @openai/agents-extensions
+   ```
+
+2. Choose your desired model package from the [Vercel's AI SDK](https://ai-sdk.dev/docs/foundations/providers-and-models) and install it:
+
+   ```bash
+   npm install @ai-sdk/openai
+   ```
+
+3. Import the adapter and model to connect to your agent:
+
+   <Code
+     lang="typescript"
+     code={aiSdkImportsExample}
+     title="Import the adapter"
+   />
+
+4. Initialize an instance of the model to be used by the agent:
+
+   <Code lang="typescript" code={aiSdkModelExample} title="Create the model" />
+
+</Steps>
+
+## Code examples
+
+<Code lang="typescript" code={aiSdkSetupExample} title="AI SDK Setup" />
+
+## Passing provider metadata
+
+If you need to send provider-specific options with a message, pass them through `providerMetadata`. The values are forwarded directly to the underlying AI SDK model. For example, the following `providerData` in the Agents SDK
+
+<Code
+  lang="typescript"
+  code={aiSdkProviderDataExample}
+  title="Agents SDK providerData"
+/>
+
+would become
+
+<Code
+  lang="typescript"
+  code={aiSdkProviderMetadataExample}
+  title="AI SDK providerMetadata"
+/>
+
+when using the AI SDK integration.
+
+## Normalizing finalized output text
+
+Some providers return structured output as plain text with extra wrapping, such as JSON code fences. If you need provider-specific cleanup before the Agents runtime validates the final output, pass `transformOutputText` when creating the adapter:
+
+<Code
+  lang="typescript"
+  code={aiSdkTransformOutputTextExample}
+  title="Normalize finalized output text"
+/>
+
+`transformOutputText` runs on finalized assistant text for non-streamed responses and on the final `response_done` event for streamed responses. It does not modify incremental `output_text_delta` events.
+
+## Retries
+
+`modelSettings.retry` works with AI SDK-backed models too, because retries are implemented by the Agents runtime rather than only by the default OpenAI provider.
+
+That means you can attach the same retry configuration you would use elsewhere:
+
+- Set `modelSettings.retry` on the `Agent`, `Runner`, or both.
+- Compose `retryPolicies` such as `networkError()`, `httpStatus([...])`, or `providerSuggested()`.
+- Keep in mind that `providerSuggested()` only helps when the wrapped AI SDK model can surface retry advice through the adapter.
+
+For a complete example using `aisdk(openai(...))`, see [`examples/ai-sdk/retry.ts`](https://github.com/openai/openai-agents-js/tree/main/examples/ai-sdk/retry.ts). For the retry API itself, including safety boundaries for streaming and stateful follow-up requests, see the [Models guide](/openai-agents-js/guides/models#model-retries).
+
+## Picking the right integration
+
+There are two related integrations in `@openai/agents-extensions`:
+
+- `@openai/agents-extensions/ai-sdk` adapts an AI SDK model so an `Agent` can run on it.
+- `@openai/agents-extensions/ai-sdk-ui` adapts a streamed Agents SDK run so AI SDK UI routes can return a standard streaming `Response`.
+
+### Notes for AI SDK models
+
+- The `@openai/agents-extensions/ai-sdk` adapter is still in beta, so it is worth testing carefully with your chosen provider, especially smaller ones.
+- If you are using OpenAI models, prefer the default OpenAI model provider instead of this adapter.
+- Supported AI SDK providers must expose `specificationVersion` `v2` or `v3`. If you need the older v1 provider style, copy the module from [examples/ai-sdk-v1](https://github.com/openai/openai-agents-js/tree/main/examples/ai-sdk-v1) into your project.
+- Computer tools require display metadata when used through this adapter. Make sure the tool includes both `environment` and `dimensions` metadata.
+- Deferred Responses tool-loading flows are not supported here. That includes `toolNamespace()`, function tools with `deferLoading: true`, and `toolSearchTool()`. If you need tool search, use an OpenAI Responses model directly. See the [Tools guide](/openai-agents-js/guides/tools#deferred-tool-loading-with-tool-search) and [Models guide](/openai-agents-js/guides/models#responses-only-deferred-tool-loading).
+
+## AI SDK UI stream helpers
+
+`@openai/agents-extensions/ai-sdk-ui` provides response helpers for wiring Agents SDK streams into AI SDK UI routes:
+
+- `createAiSdkTextStreamResponse(source, options?)` for plain text streaming responses.
+- `createAiSdkUiMessageStream(source)` for a lower-level `ReadableStream<UIMessageChunk>`.
+- `createAiSdkUiMessageStreamResponse(source, options?)` for `UIMessageChunk` streaming responses.
+
+These helpers accept a `StreamedRunResult`, stream-like source, or compatible wrapper object. The response helpers return a `Response` with streaming-friendly headers.
+
+Use `createAiSdkUiMessageStreamResponse(...)` when your route should return the AI SDK response directly. Use `createAiSdkUiMessageStream(...)` when you want to own the response or rendering layer while still using the maintained Agents SDK to AI SDK `UIMessageChunk` translation. Use `createAiSdkTextStreamResponse(...)` when you only want plain text.
+
+The response helpers also accept optional response settings through `options`:
+
+- `headers`: additional response headers to merge into the streaming response.
+- `status`: the HTTP status code for the returned `Response`.
+- `statusText`: the HTTP status text for the returned `Response`.
+
+Example lower-level UI message stream:
+
+<Code
+  lang="typescript"
+  code={aiSdkUiMessageStreamExample}
+  title="UI message stream"
+/>
+
+Example Next.js route for UI message streaming:
+
+<Code
+  lang="typescript"
+  code={aiSdkUiMessageStreamResponseExample}
+  title="UI message stream response"
+/>
+
+Example Next.js route for text-only streaming:
+
+<Code
+  lang="typescript"
+  code={aiSdkTextStreamResponseExample}
+  title="Text stream response"
+/>
+
+For end-to-end usage, see the `examples/ai-sdk-ui` app in this repository.

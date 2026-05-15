@@ -1,0 +1,63 @@
+name: Changesets Release
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  CI: true
+
+jobs:
+  version:
+    if: ${{ github.repository == 'openai/openai-agents-js' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.sha == github.event.workflow_run.head_sha }}
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write  # required for trusted publishing
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788
+
+      - name: Setup node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.x'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+          always-auth: true  # Optional but avoids intermittent ENEEDAUTH issues in pnpm monorepos
+
+      - name: Show Node & npm versions
+        run: |
+          node -v
+          npm -v
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build packages
+        run: pnpm build:ci
+
+      - name: Create and publish versions
+        id: changesets
+        uses: changesets/action@6a0a831ff30acef54f2c6aa1cbbc1096b066edaf
+        with:
+          commit: 'chore: update versions'
+          title: 'chore: update versions'
+          version: pnpm bump-version
+          publish: pnpm ci:publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
+          NPM_CONFIG_ACCESS: public

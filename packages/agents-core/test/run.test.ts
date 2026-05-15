@@ -1,0 +1,6241 @@
+import { Buffer } from 'node:buffer';
+import {
+  beforeAll,
+  beforeEach,
+  afterEach,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+  vi,
+} from 'vitest';
+import { z } from 'zod';
+import {
+  Agent,
+  InputGuardrailTripwireTriggered,
+  MaxTurnsExceededError,
+  ModelRefusalError,
+  ModelResponse,
+  OutputGuardrailTripwireTriggered,
+  Session,
+  UserError,
+  ModelInputData,
+  type OutputGuardrailFunctionArgs,
+  type AgentInputItem,
+  extractAllTextOutput,
+  run,
+  Runner,
+  setDefaultModelProvider,
+  setTraceProcessors,
+  setTracingDisabled,
+  BatchTraceProcessor,
+  user,
+  assistant,
+  type ToolExecutionConfig,
+} from '../src';
+import { RunStreamEvent } from '../src/events';
+import { ServerConversationTracker } from '../src/runner/conversation';
+import { removeAllTools } from '../src/extensions';
+import { handoff } from '../src/handoff';
+import {
+  RunHandoffOutputItem,
+  RunMessageOutputItem as MessageOutputItem,
+  RunToolApprovalItem as ToolApprovalItem,
+  RunToolCallOutputItem as ToolCallOutputItem,
+  RunToolSearchCallItem,
+  RunToolSearchOutputItem,
+} from '../src/items';
+import { getTurnInput, selectModel } from '../src/run';
+import { RunContext } from '../src/runContext';
+import { RunState } from '../src/runState';
+import * as protocol from '../src/types/protocol';
+import { Usage } from '../src/usage';
+import {
+  attachClientToolSearchExecutor,
+  tool,
+  hostedMcpTool,
+  computerTool,
+  shellTool,
+} from '../src/tool';
+import logger from '../src/logger';
+import { getGlobalTraceProvider } from '../src/tracing/provider';
+import {
+  FakeModel,
+  fakeModelRefusal,
+  fakeModelMessageWithRefusal,
+  fakeModelMessage,
+  FakeModelProvider,
+  FakeTracingExporter,
+  TEST_MODEL_MESSAGE,
+  TEST_MODEL_RESPONSE_BASIC,
+  TEST_MODEL_FUNCTION_CALL,
+  TEST_TOOL,
+  FakeComputer,
+} from './stubs';
+import {
+  Model,
+  ModelProvider,
+  ModelRequest,
+  ModelSettings,
+} from '../src/model';
+
+function getFirstTextContent(item: AgentInputItem): string | undefined {
+  if (item.type !== 'message') {
+    return undefined;
+  }
+  if (typeof item.content === 'string') {
+    return item.content;
+  }
+  if (Array.isArray(item.content)) {
+    const first = item.content[0] as { text?: string };
+    return first?.text;
+  }
+  return undefined;
+}
+
+function getRequestInputItems(request: ModelRequest): AgentInputItem[] {
+  return Array.isArray(request.input) ? request.input : [];
+}
+
+describe('Runner.run', () => {
+  beforeAll(() => {
+    setTracingDisabled(true);
+    setDefaultModelProvider(new FakeModelProvider());
+  });
+
+  describe('basic', () => {
+    it('accepts public tool execution config', () => {
+      const toolExecution = {
+        maxFunctionToolConcurrency: 2,
+      } satisfies ToolExecutionConfig;
+
+      const runner = new Runner({
+        tracingDisabled: true,
+        toolExecution,
+      });
+
+      expect(runner.config.toolExecution).toBe(toolExecution);
+    });
+
+    it('rejects invalid function tool concurrency config', () => {
+      expect(
+        () =>
+          new Runner({
+            tracingDisabled: true,
+            toolExecution: { maxFunctionToolConcurrency: 0 },
+          }),
+      ).toThrow(UserError);
+      expect(
+        () =>
+          new Runner({
+            tracingDisabled: true,
+            toolExecution: { maxFunctionToolConcurrency: 1.5 },
+          }),
+      ).toThrow(
+        'toolExecution.maxFunctionToolConcurrency must be an integer greater than or equal to 1.',
+      );
+    });
+
+    it('does not persist nested agent-tool metadata when resuming a RunState', async () => {
+      const agent = new Agent({
+        name: 'ReusedNestedStateAgent',
+        instructions: 'Finish the run.',
+        model: new FakeModel([TEST_MODEL_RESPONSE_BASIC]),
+      });
+      const nestedState = new RunState(new RunContext(), 'input', agent, 1);
+      nestedState._agentToolInvocation = {
+        toolName: 'nested_tool',
+        toolCallId: 'call-outer',
+        toolArguments: '{"input":"hello"}',
+      };
+      const restoredState = await RunState.fromString(
+        agent,
+        nestedState.toString(),
+      );
+
+      const result = await new Runner().run(agent, restoredState);
+
+      expect(result.agentToolInvocation).toBeUndefined();
+      expect(restoredState._agentToolInvocation).toBeUndefined();
+      expect(restoredState.toJSON()).not.toHaveProperty('agentToolInvocation');
+    });
+
+    it('clears stale agent-tool metadata when reusing an in-memory RunState', async () => {
+      const agent = new Agent({
+        name: 'ReusedInMemoryNestedStateAgent',
+        instructions: 'Finish the run.',
+        model: new FakeModel([TEST_MODEL_RESPONSE_BASIC]),
+      });
+      const nestedState = new RunState(new RunContext(), 'input', agent, 1);
+      nestedState._agentToolInvocation = {
+        toolName: 'nested_tool',
+        toolCallId: 'call-outer',
+        toolArguments: '{"input":"hello"}',
+      };
+
+      const result = await new Runner().run(agent, nestedState);
+
+      expect(result.agentToolInvocation).toBeUndefined();
+      expect(nestedState._agentToolInvocation).toBeUndefined();
+    });
+
+    function buildRejectedToolRunState(
+      agent: Agent<any, any>,
+      rejectMessage?: string,
+    ) {
+      const rawItem = {
+        name: 'toolZ',
+        callId: 'c1',
+        type: 'function_call',
+        arguments: '{}',
+      } as any;
+      const approvalItem = new ToolApprovalItem(rawItem, agent);
+      const state = new RunState(new RunContext(), '', agent, 1);
+      state._currentStep = {
+        type: 'next_step_interruption',
+        data: { interruptions: [approvalItem] },
+      };
+      state.reject(
+        approvalItem,
+        rejectMessage !== undefined ? { message: rejectMessage } : undefined,
+      );
+      state._generatedItems.push(approvalItem);
+      state._lastTurnResponse = {
+        output: [],
+        usage: {
+          requests: 1,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+        },
+        responseId: 'abc',
+      } as any;
+      state._lastProcessedResponse = {
+        newItems: [],
+        functions: [
+          {
+            toolCall: rawItem,
+            tool: {
+              name: 'toolZ',
+              invoke: async () => 'wrong path',
+              needsApproval: async () => true,
+            },
+          },
+        ],
+        handoffs: [],
+        mcpApprovalRequests: [],
+        computerActions: [],
+      } as any;
+      return { state };
+    }
+
+    it('should run a basic agent', async () => {
+      const agent = new Agent({
+        name: 'Test',
+      });
+
+      const result = await run(agent, 'Hello');
+
+      expect(result.finalOutput).toBe('Hello World');
+      expectTypeOf(result.finalOutput).toEqualTypeOf<string | undefined>();
+    });
+
+    it('rejects custom client tool_search parameters without execute before calling the model', async () => {
+      const getResponse = vi.fn().mockResolvedValue(TEST_MODEL_RESPONSE_BASIC);
+      const model: Model = {
+        getResponse,
+        async *getStreamedResponse() {
+          yield* [];
+        },
+      };
+      const agent = new Agent({
+        name: 'ClientToolSearchValidationAgent',
+        model,
+        tools: [
+          {
+            type: 'hosted_tool',
+            name: 'tool_search',
+            providerData: {
+              type: 'tool_search',
+              execution: 'client',
+              parameters: {
+                type: 'object',
+                properties: {
+                  namespaceHints: {
+                    type: 'array',
+                    items: { type: 'string' },
+                  },
+                },
+                required: ['namespaceHints'],
+                additionalProperties: false,
+              },
+            },
+          } as any,
+        ],
+      });
+
+      const runPromise = new Runner().run(agent, 'hello');
+
+      await expect(runPromise).rejects.toThrow(UserError);
+      await expect(runPromise).rejects.toThrow(
+        /require toolSearchTool\(\{ execution: "client", execute \}\)/,
+      );
+      expect(getResponse).not.toHaveBeenCalled();
+    });
+
+    it('loads runtime tools from custom client tool_search execute callbacks across turns', async () => {
+      const lookupAccount = tool({
+        name: 'lookup_account',
+        description: 'Look up an account in CRM.',
+        parameters: z.object({
+          accountId: z.string(),
+        }),
+        execute: async ({ accountId }) => `account:${accountId}`,
+      });
+      const execute = vi.fn().mockResolvedValue(lookupAccount);
+      const toolSearch = attachClientToolSearchExecutor(
+        {
+          type: 'hosted_tool',
+          name: 'tool_search',
+          providerData: {
+            type: 'tool_search',
+            execution: 'client',
+            parameters: {
+              type: 'object',
+              properties: {
+                namespaceHints: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+              },
+              required: ['namespaceHints'],
+              additionalProperties: false,
+            },
+          },
+        },
+        execute,
+      );
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              type: 'tool_search_call',
+              id: 'ts_call_lookup',
+              status: 'completed',
+              arguments: {
+                namespaceHints: ['crm'],
+              },
+              providerData: {
+                call_id: 'call_tool_search_lookup',
+              },
+            } as protocol.ToolSearchCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [
+            {
+              type: 'function_call',
+              id: 'fc_lookup_account',
+              callId: 'call_lookup_account',
+              name: 'lookup_account',
+              status: 'completed',
+              arguments: JSON.stringify({ accountId: 'acct_42' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('Account loaded.')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'CustomClientToolSearchAgent',
+        model,
+        tools: [toolSearch],
+      });
+      const state = new RunState(new RunContext(), 'hello', agent, 10);
+
+      const result = await new Runner().run(agent, state);
+
+      expect(result.finalOutput).toBe('Account loaded.');
+      expect(execute).toHaveBeenCalledTimes(1);
+      const executeArgs = execute.mock.calls[0]?.[0];
+      expect(executeArgs?.agent).toBe(agent);
+      expect(executeArgs?.availableTools).toEqual([toolSearch]);
+      expect(executeArgs?.runContext).toBe(state._context);
+      expect(executeArgs?.toolCall).toMatchObject({
+        type: 'tool_search_call',
+        arguments: {
+          namespaceHints: ['crm'],
+        },
+      });
+      expect(executeArgs?.loadDefault).toEqual(expect.any(Function));
+      expect(state.getToolSearchRuntimeTools(agent)).toEqual([lookupAccount]);
+      expect(executeArgs?.loadDefault(['missing_tool'])).toEqual([]);
+    });
+
+    it('rehydrates custom client tool_search runtime tools after RunState serialization', async () => {
+      const lookupAccount = tool({
+        name: 'lookup_account',
+        description: 'Look up an account in CRM.',
+        parameters: z.object({
+          accountId: z.string(),
+        }),
+        execute: async ({ accountId }) => `account:${accountId}`,
+      });
+      const execute = vi.fn().mockResolvedValue(lookupAccount);
+      const toolSearch = attachClientToolSearchExecutor(
+        {
+          type: 'hosted_tool',
+          name: 'tool_search',
+          providerData: {
+            type: 'tool_search',
+            execution: 'client',
+            parameters: {
+              type: 'object',
+              properties: {
+                namespaceHints: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+              },
+              required: ['namespaceHints'],
+              additionalProperties: false,
+            },
+          },
+        },
+        execute,
+      );
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              type: 'tool_search_call',
+              id: 'ts_call_lookup',
+              status: 'completed',
+              arguments: {
+                namespaceHints: ['crm'],
+              },
+              providerData: {
+                call_id: 'call_tool_search_lookup',
+              },
+            } as protocol.ToolSearchCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [
+            {
+              type: 'function_call',
+              id: 'fc_lookup_account',
+              callId: 'call_lookup_account',
+              name: 'lookup_account',
+              status: 'completed',
+              arguments: JSON.stringify({ accountId: 'acct_42' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('Account loaded.')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'SerializedCustomClientToolSearchAgent',
+        model,
+        tools: [toolSearch],
+      });
+      const initialError = await run(agent, 'hello', { maxTurns: 1 }).catch(
+        (error) => error,
+      );
+
+      expect(initialError).toBeInstanceOf(MaxTurnsExceededError);
+      const state = (initialError as MaxTurnsExceededError).state as RunState<
+        unknown,
+        Agent<any, any>
+      >;
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(state.getToolSearchRuntimeTools(agent)).toEqual([lookupAccount]);
+
+      const restored = await RunState.fromString(agent, state.toString());
+      restored._maxTurns = 10;
+
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(restored.getToolSearchRuntimeTools(agent)).toEqual([
+        lookupAccount,
+      ]);
+
+      const resumedResult = await run(agent, restored);
+
+      expect(resumedResult.finalOutput).toBe('Account loaded.');
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(resumedResult.history).toContainEqual(
+        expect.objectContaining({
+          type: 'function_call',
+          name: 'lookup_account',
+        }),
+      );
+    });
+
+    it('fails early when custom client tool_search runtime tools are resumed without an executor', async () => {
+      const toolSearch = {
+        type: 'hosted_tool',
+        name: 'tool_search',
+        providerData: {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: {
+            type: 'object',
+            properties: {
+              namespaceHints: {
+                type: 'array',
+                items: { type: 'string' },
+              },
+            },
+            required: ['namespaceHints'],
+            additionalProperties: false,
+          },
+        },
+      } as const;
+      const agent = new Agent({
+        name: 'MissingExecutorToolSearchAgent',
+        model: new FakeModel(),
+        tools: [toolSearch as any],
+      });
+      const state = new RunState(new RunContext(), 'hello', agent, 10);
+      state._generatedItems.push(
+        new RunToolSearchCallItem(
+          {
+            type: 'tool_search_call',
+            id: 'ts_call_lookup',
+            status: 'completed',
+            arguments: {
+              namespaceHints: ['crm'],
+            },
+            providerData: {
+              call_id: 'call_tool_search_lookup',
+              execution: 'client',
+            },
+          } as protocol.ToolSearchCallItem,
+          agent,
+        ),
+        new RunToolSearchOutputItem(
+          {
+            type: 'tool_search_output',
+            status: 'completed',
+            tools: [
+              {
+                type: 'function',
+                name: 'lookup_account',
+                description: 'Look up an account in CRM.',
+                strict: true,
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    accountId: {
+                      type: 'string',
+                    },
+                  },
+                  required: ['accountId'],
+                  additionalProperties: false,
+                },
+              },
+            ],
+            providerData: {
+              call_id: 'call_tool_search_lookup',
+              execution: 'client',
+            },
+          } as protocol.ToolSearchOutputItem,
+          agent,
+        ),
+      );
+
+      await expect(() =>
+        RunState.fromString(agent, state.toString()),
+      ).rejects.toThrow(
+        /no longer provides toolSearchTool\(\{ execution: "client", execute \}\)/,
+      );
+    });
+
+    it('does not require rehydration for built-in client tool_search outputs that match configured deferred tools', async () => {
+      const getShippingEta = tool({
+        name: 'get_shipping_eta',
+        description: 'Look up a shipping ETA.',
+        parameters: z.object({
+          trackingNumber: z.string(),
+        }),
+        deferLoading: true,
+        execute: async () => 'tomorrow',
+      });
+      const agent = new Agent({
+        name: 'BuiltInClientToolSearchResumeAgent',
+        model: new FakeModel(),
+        tools: [getShippingEta],
+      });
+      const state = new RunState(new RunContext(), 'hello', agent, 10);
+      state._generatedItems.push(
+        new RunToolSearchCallItem(
+          {
+            type: 'tool_search_call',
+            id: 'ts_call_shipping',
+            status: 'completed',
+            arguments: {
+              paths: ['get_shipping_eta'],
+            },
+            providerData: {
+              call_id: 'call_tool_search_shipping',
+              execution: 'client',
+            },
+          } as protocol.ToolSearchCallItem,
+          agent,
+        ),
+        new RunToolSearchOutputItem(
+          {
+            type: 'tool_search_output',
+            status: 'completed',
+            tools: [
+              {
+                type: 'function',
+                name: 'get_shipping_eta',
+                description: 'Look up a shipping ETA.',
+                strict: true,
+                deferLoading: true,
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    trackingNumber: {
+                      type: 'string',
+                    },
+                  },
+                  required: ['trackingNumber'],
+                  additionalProperties: false,
+                },
+              },
+            ],
+            providerData: {
+              call_id: 'call_tool_search_shipping',
+              execution: 'client',
+            },
+          } as protocol.ToolSearchOutputItem,
+          agent,
+        ),
+      );
+
+      const restored = await RunState.fromString(agent, state.toString());
+
+      expect(restored.getToolSearchRuntimeTools(agent)).toEqual([]);
+    });
+
+    it('treats prior tool_search outputs in input history as loaded deferred tools', async () => {
+      const getShippingEta = tool({
+        name: 'get_shipping_eta',
+        description: 'Look up a shipping ETA.',
+        parameters: z.object({
+          trackingNumber: z.string(),
+        }),
+        deferLoading: true,
+        execute: async () => 'tomorrow',
+      });
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              type: 'function_call',
+              id: 'fc_shipping_eta',
+              callId: 'call_shipping_eta',
+              name: 'get_shipping_eta',
+              status: 'completed',
+              arguments: JSON.stringify({ trackingNumber: 'ZX-123' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('The package arrives tomorrow.')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'ShippingAgent',
+        instructions: 'Use the tool when it is available.',
+        model,
+        tools: [getShippingEta],
+        toolUseBehavior: 'run_llm_again',
+      });
+      const inputHistory: AgentInputItem[] = [
+        user('Load shipping tools first.'),
+        {
+          type: 'tool_search_output',
+          status: 'completed',
+          tools: [
+            {
+              type: 'tool_reference',
+              functionName: 'get_shipping_eta',
+            },
+          ],
+        } as any,
+      ];
+
+      const result = await run(agent, inputHistory);
+
+      expect(result.finalOutput).toBe('The package arrives tomorrow.');
+      expect(result.history).toContainEqual(
+        expect.objectContaining({
+          type: 'function_call',
+          name: 'get_shipping_eta',
+        }),
+      );
+    });
+
+    it('exposes aggregated usage on run results', async () => {
+      const model = new FakeModel([
+        {
+          output: [fakeModelMessage('hi there')],
+          usage: new Usage({
+            requests: 1,
+            inputTokens: 2,
+            outputTokens: 3,
+            totalTokens: 5,
+          }),
+          responseId: 'usage-res',
+        },
+      ]);
+      const agent = new Agent({
+        name: 'UsageAgent',
+        model,
+      });
+
+      const result = await run(agent, 'ping');
+
+      expect(result.state.usage.inputTokens).toBe(2);
+      expect(result.state.usage.outputTokens).toBe(3);
+      expect(result.state.usage.totalTokens).toBe(5);
+      expect(result.state.usage.requestUsageEntries).toEqual([
+        {
+          inputTokens: 2,
+          outputTokens: 3,
+          totalTokens: 5,
+          inputTokensDetails: {},
+          outputTokensDetails: {},
+        },
+      ]);
+    });
+
+    it('emits turn input on agent_start lifecycle hooks', async () => {
+      const model = new FakeModel([
+        {
+          output: [fakeModelMessage('Acknowledged')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'LifecycleInputAgent',
+        model,
+      });
+      const runner = new Runner();
+
+      const agentInputs: AgentInputItem[][] = [];
+      const runnerInputs: AgentInputItem[][] = [];
+
+      agent.on('agent_start', (_context, _agent, turnInput) => {
+        agentInputs.push(turnInput ?? []);
+      });
+      runner.on('agent_start', (_context, _agent, turnInput) => {
+        runnerInputs.push(turnInput ?? []);
+      });
+
+      await runner.run(agent, 'capture this input for tracing');
+
+      expect(agentInputs).toHaveLength(1);
+      expect(runnerInputs).toHaveLength(1);
+      expect(agentInputs[0].map(getFirstTextContent)).toEqual([
+        'capture this input for tracing',
+      ]);
+      expect(runnerInputs[0].map(getFirstTextContent)).toEqual([
+        'capture this input for tracing',
+      ]);
+    });
+
+    it('applies toolChoice updates from agent_tool_end before the next model call', async () => {
+      class ToolChoiceTrackingModel implements Model {
+        requests: ModelRequest[] = [];
+        private callCount = 0;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          this.callCount += 1;
+
+          if (this.callCount === 1) {
+            return {
+              output: [
+                {
+                  ...TEST_MODEL_FUNCTION_CALL,
+                  id: 'tool-call-1',
+                  callId: 'tool-call-1',
+                  name: 'test',
+                  arguments: '{"test":"first"}',
+                },
+              ],
+              usage: new Usage(),
+            };
+          }
+
+          return {
+            output: [fakeModelMessage('finished')],
+            usage: new Usage(),
+          };
+        }
+
+        async *getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          yield* [];
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new ToolChoiceTrackingModel();
+      const agent = new Agent({
+        name: 'ToolChoiceLifecycleAgent',
+        model,
+        tools: [TEST_TOOL],
+        modelSettings: { toolChoice: 'required' },
+      });
+
+      agent.on('agent_tool_end', () => {
+        agent.modelSettings.toolChoice = 'none';
+      });
+
+      const result = await run(agent, 'trigger tool');
+
+      expect(result.finalOutput).toBe('finished');
+      expect(model.requests).toHaveLength(2);
+      expect(model.requests[0]?.modelSettings.toolChoice).toBe('required');
+      expect(model.requests[1]?.modelSettings.toolChoice).toBe('none');
+    });
+
+    it('sholuld handle structured output', async () => {
+      const fakeModel = new FakeModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('{"city": "San Francisco"}')],
+        },
+      ]);
+
+      const runner = new Runner();
+      const agent = new Agent({
+        name: 'Test',
+        model: fakeModel,
+        outputType: z.object({
+          city: z.string(),
+        }),
+      });
+
+      const result = await runner.run(
+        agent,
+        'What is the weather in San Francisco?',
+      );
+
+      expect(result.finalOutput).toEqual({ city: 'San Francisco' });
+      expectTypeOf(result.finalOutput).toEqualTypeOf<
+        { city: string } | undefined
+      >();
+    });
+
+    it('returns static final output when tool execution is rejected', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(agent);
+
+      const result = await run(agent, state);
+
+      expect(result.finalOutput).toBe('Tool execution was not approved.');
+    });
+
+    it('uses toolErrorFormatter for static final output when tool execution is rejected', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(agent);
+      const runner = new Runner({
+        toolErrorFormatter: () =>
+          'Tool execution was dismissed. You may retry this tool later.',
+      });
+
+      const result = await runner.run(agent, state);
+
+      expect(result.finalOutput).toBe(
+        'Tool execution was dismissed. You may retry this tool later.',
+      );
+    });
+
+    it('prefers per-run toolErrorFormatter over runner config', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(agent);
+      const runner = new Runner({
+        toolErrorFormatter: () => 'runner default rejection',
+      });
+
+      const result = await runner.run(agent, state, {
+        toolErrorFormatter: () => 'per-run rejection',
+      });
+
+      expect(result.finalOutput).toBe('per-run rejection');
+    });
+
+    it('uses reject message as final output when provided', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(
+        agent,
+        'Tool execution was dismissed. You may retry this tool later.',
+      );
+
+      const result = await run(agent, state);
+
+      expect(result.finalOutput).toBe(
+        'Tool execution was dismissed. You may retry this tool later.',
+      );
+    });
+
+    it('reject message takes precedence over toolErrorFormatter', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(
+        agent,
+        'per-call rejection message',
+      );
+      const runner = new Runner({
+        toolErrorFormatter: () => 'formatter rejection',
+      });
+
+      const result = await runner.run(agent, state);
+
+      expect(result.finalOutput).toBe('per-call rejection message');
+    });
+
+    it('reject message preserves an empty string', async () => {
+      const agent = new Agent({
+        name: 'RejectTest',
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+      const { state } = buildRejectedToolRunState(agent, '');
+      const runner = new Runner({
+        toolErrorFormatter: () => 'formatter rejection',
+      });
+
+      const result = await runner.run(agent, state);
+
+      expect(result.finalOutput).toBe('');
+    });
+
+    it('propagates model errors', async () => {
+      const agent = new Agent({ name: 'Fail', model: new FakeModel() });
+
+      await expect(run(agent, 'fail')).rejects.toThrow('No response found');
+    });
+
+    it('sets overridePromptModel when agent supplies a prompt and explicit model', async () => {
+      class CapturingModel implements Model {
+        lastRequest?: ModelRequest;
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.lastRequest = request;
+          return {
+            output: [fakeModelMessage('override')],
+            usage: new Usage(),
+          };
+        }
+        async *getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          yield* [];
+          throw new Error('Not implemented');
+        }
+      }
+
+      const capturingModel = new CapturingModel();
+
+      const agent = new Agent({
+        name: 'Prompted',
+        instructions: 'Use the prompt.',
+        model: capturingModel,
+        prompt: { promptId: 'prompt_123' },
+      });
+
+      await run(agent, 'hello');
+
+      expect(capturingModel.lastRequest?.prompt).toBeDefined();
+      expect(capturingModel.lastRequest?.overridePromptModel).toBe(true);
+    });
+
+    it('serializes GA computer tools without requiring display metadata', async () => {
+      class CapturingModel implements Model {
+        lastRequest?: ModelRequest;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.lastRequest = request;
+          return {
+            output: [fakeModelMessage('computer ok')],
+            usage: new Usage(),
+          };
+        }
+
+        async *getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          yield* [];
+          throw new Error('Not implemented');
+        }
+      }
+
+      const capturingModel = new CapturingModel();
+      const agent = new Agent({
+        name: 'ComputerPrompted',
+        model: capturingModel,
+        tools: [
+          computerTool({
+            computer: {
+              screenshot: async () => 'img',
+              click: async () => {},
+              doubleClick: async () => {},
+              drag: async () => {},
+              keypress: async () => {},
+              move: async () => {},
+              scroll: async () => {},
+              type: async () => {},
+              wait: async () => {},
+            } as any,
+          }),
+        ],
+      });
+
+      const result = await run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('computer ok');
+      expect(capturingModel.lastRequest?.tools).toEqual([
+        {
+          type: 'computer',
+          name: 'computer_use_preview',
+        },
+      ]);
+    });
+
+    it('emits agent_end lifecycle event for non-streaming agents', async () => {
+      const agent = new Agent({
+        name: 'TestAgent',
+      });
+
+      // Track agent_end events on both the agent and runner
+      const agentEndEvents: Array<{ context: any; output: string }> = [];
+      const runnerEndEvents: Array<{
+        context: any;
+        agent: any;
+        output: string;
+      }> = [];
+
+      agent.on('agent_end', (context, output) => {
+        agentEndEvents.push({ context, output });
+      });
+
+      const runner = new Runner();
+      runner.on('agent_end', (context, agent, output) => {
+        runnerEndEvents.push({ context, agent, output });
+      });
+
+      const result = await runner.run(agent, 'test input');
+
+      // Verify the result has the expected output
+      expect(result.finalOutput).toBe('Hello World');
+
+      // Verify agent_end was called on both agent and runner
+      expect(agentEndEvents).toHaveLength(1);
+      expect(agentEndEvents[0].output).toBe('Hello World');
+
+      expect(runnerEndEvents).toHaveLength(1);
+      expect(runnerEndEvents[0].agent).toBe(agent);
+      expect(runnerEndEvents[0].output).toBe('Hello World');
+    });
+
+    it('emits agent_end once when final output comes from tool results', async () => {
+      const model = new FakeModel([
+        { output: [{ ...TEST_MODEL_FUNCTION_CALL }], usage: new Usage() },
+      ]);
+      const agent = new Agent({
+        name: 'ToolAgent',
+        model,
+        tools: [TEST_TOOL],
+        toolUseBehavior: 'stop_on_first_tool',
+      });
+
+      const agentEndEvents: Array<{ context: any; output: string }> = [];
+      const runnerEndEvents: Array<{
+        context: any;
+        agent: any;
+        output: string;
+      }> = [];
+
+      agent.on('agent_end', (context, output) => {
+        agentEndEvents.push({ context, output });
+      });
+
+      const runner = new Runner();
+      runner.on('agent_end', (context, endAgent, output) => {
+        runnerEndEvents.push({ context, agent: endAgent, output });
+      });
+
+      const result = await runner.run(agent, 'trigger tool');
+
+      expect(result.finalOutput).toBe('Hello World');
+      expect(agentEndEvents).toHaveLength(1);
+      expect(agentEndEvents[0].output).toBe('Hello World');
+      expect(runnerEndEvents).toHaveLength(1);
+      expect(runnerEndEvents[0].agent).toBe(agent);
+      expect(runnerEndEvents[0].output).toBe('Hello World');
+    });
+
+    it('disposes computer lifecycle initializers after a completed run', async () => {
+      const createdComputer = new FakeComputer();
+      const create = vi.fn(async () => createdComputer);
+      const dispose = vi.fn(async () => {});
+      const computer = computerTool({
+        computer: { create, dispose },
+      });
+      const model = new FakeModel([
+        { output: [fakeModelMessage('done')], usage: new Usage() },
+      ]);
+      const agent = new Agent({
+        name: 'ComputerAgent',
+        model,
+        tools: [computer],
+      });
+
+      const result = await run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('done');
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledWith({
+        runContext: result.state._context,
+        computer: createdComputer,
+      });
+    });
+
+    it('calls initRun once per run and skips reinitializing on resume', async () => {
+      const computerInstance = new FakeComputer() as FakeComputer & {
+        initRun?: (ctx?: RunContext) => Promise<void>;
+      };
+      computerInstance.initRun = vi.fn(async () => {});
+      const computer = computerTool({
+        computer: computerInstance,
+      });
+
+      const approvalTool = tool({
+        name: 'needsApproval',
+        description: 'requires approval',
+        parameters: z.object({}).strict(),
+        execute: async () => 'ok',
+        needsApproval: true,
+      });
+
+      const functionCall: protocol.FunctionCallItem = {
+        ...TEST_MODEL_FUNCTION_CALL,
+        name: 'needsApproval',
+        callId: 'call-1',
+        arguments: '{}',
+      };
+      const model = new FakeModel([
+        {
+          output: [functionCall, fakeModelMessage('pending')],
+          usage: new Usage(),
+        },
+        { output: [fakeModelMessage('all done')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({
+        name: 'ApprovalAgent',
+        model,
+        tools: [computer, approvalTool],
+      });
+
+      const firstRun = await run(agent, 'hello');
+      expect(firstRun.interruptions).toHaveLength(1);
+      expect(computerInstance.initRun).toHaveBeenCalledTimes(1);
+
+      const approval = firstRun.interruptions?.[0];
+      firstRun.state._context.approveTool(approval);
+      await run(agent, firstRun.state);
+
+      expect(computerInstance.initRun).toHaveBeenCalledTimes(1);
+    });
+
+    it('reinitializes computer tools when reusing a RunContext across runs', async () => {
+      const computerInstance = new FakeComputer() as FakeComputer & {
+        initRun?: (ctx?: RunContext) => Promise<void>;
+      };
+      computerInstance.initRun = vi.fn(async () => {});
+      const computer = computerTool({
+        computer: computerInstance,
+      });
+      const model = new FakeModel([
+        { output: [fakeModelMessage('done once')], usage: new Usage() },
+        { output: [fakeModelMessage('done twice')], usage: new Usage() },
+      ]);
+      const agent = new Agent({
+        name: 'ComputerAgent',
+        model,
+        tools: [computer],
+      });
+      const runContext = new RunContext();
+
+      await run(agent, 'hello', { context: runContext });
+      await run(agent, 'hello again', { context: runContext });
+
+      expect(computerInstance.initRun).toHaveBeenCalledTimes(2);
+    });
+
+    it('initializes computer tools when they appear after a handoff', async () => {
+      const computerA = new FakeComputer() as FakeComputer & {
+        initRun?: (ctx?: RunContext) => Promise<void>;
+      };
+      computerA.initRun = vi.fn(async () => {});
+      const computerB = new FakeComputer() as FakeComputer & {
+        initRun?: (ctx?: RunContext) => Promise<void>;
+      };
+      computerB.initRun = vi.fn(async () => {});
+
+      const toolA = computerTool({ name: 'computer_a', computer: computerA });
+      const toolB = computerTool({ name: 'computer_b', computer: computerB });
+
+      const agentB = new Agent({
+        name: 'HandoffB',
+        model: new FakeModel([
+          { output: [fakeModelMessage('done B')], usage: new Usage() },
+        ]),
+        tools: [toolB],
+      });
+      const handoffToB = handoff(agentB);
+      const callItem: protocol.FunctionCallItem = {
+        id: 'handoff-1',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'call-1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'HandoffA',
+        model: new FakeModel([{ output: [callItem], usage: new Usage() }]),
+        handoffs: [handoffToB],
+        tools: [toolA],
+      });
+
+      const runner = new Runner();
+      const result = await runner.run(agentA, 'hello');
+
+      expect(result.finalOutput).toBe('done B');
+      expect(computerA.initRun).toHaveBeenCalledTimes(1);
+      expect(computerB.initRun).toHaveBeenCalledTimes(1);
+    });
+
+    it('defers disposal while a run is interrupted and cleans up after resuming', async () => {
+      const createdComputer = new FakeComputer();
+      const create = vi.fn(async () => createdComputer);
+      const dispose = vi.fn(async () => {});
+      const computer = computerTool({
+        computer: { create, dispose },
+      });
+
+      const approvalTool = tool({
+        name: 'needsApproval',
+        description: 'requires approval',
+        parameters: z.object({}).strict(),
+        execute: async () => 'ok',
+        needsApproval: true,
+      });
+
+      const functionCall: protocol.FunctionCallItem = {
+        ...TEST_MODEL_FUNCTION_CALL,
+        name: 'needsApproval',
+        callId: 'call-1',
+        arguments: '{}',
+      };
+      const model = new FakeModel([
+        {
+          output: [functionCall, fakeModelMessage('pending')],
+          usage: new Usage(),
+        },
+        { output: [fakeModelMessage('all done')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({
+        name: 'ApprovalAgent',
+        model,
+        tools: [computer, approvalTool],
+      });
+
+      const firstRun = await run(agent, 'hello');
+      expect(firstRun.interruptions).toHaveLength(1);
+      expect(dispose).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
+
+      const approval = firstRun.interruptions?.[0];
+      if (!approval) {
+        throw new Error('Expected an approval interruption');
+      }
+      firstRun.state.approve(approval);
+
+      const finalRun = await run(agent, firstRun.state);
+
+      expect(finalRun.finalOutput).toBe('all done');
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledWith({
+        runContext: finalRun.state._context,
+        computer: createdComputer,
+      });
+    });
+  });
+
+  describe('additional scenarios', () => {
+    class StreamingModel extends FakeModel {
+      constructor(resp: protocol.AssistantMessageItem) {
+        super([{ output: [resp], usage: new Usage() }]);
+        this._resp = resp;
+      }
+      private _resp: protocol.AssistantMessageItem;
+      override async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
+        yield {
+          type: 'output_text_delta',
+          delta: 'hi',
+          providerData: {},
+        } as any;
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'r1',
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+            output: [this._resp],
+          },
+        } as any;
+      }
+    }
+
+    it('resumes from serialized RunState', async () => {
+      const agent = new Agent({
+        name: 'Resume',
+        model: new FakeModel([
+          { output: [fakeModelMessage('hi')], usage: new Usage() },
+        ]),
+      });
+      const first = await run(agent, 'hi');
+      const json = first.state.toJSON();
+      delete (json as any).currentAgentSpan;
+      const restored = await RunState.fromString(agent, JSON.stringify(json));
+      const resumed = await run(agent, restored);
+      expect(resumed.finalOutput).toBe(first.finalOutput);
+    });
+
+    it('resumes from schema 1.0 RunState', async () => {
+      const agent = new Agent({
+        name: 'ResumeV1',
+        model: new FakeModel([
+          { output: [fakeModelMessage('hi')], usage: new Usage() },
+        ]),
+      });
+      const first = await run(agent, 'hi');
+      const json = first.state.toJSON() as any;
+      delete json.currentAgentSpan;
+      delete json.currentTurnInProgress;
+      delete json.conversationId;
+      delete json.previousResponseId;
+      json.$schemaVersion = '1.0';
+      const restored = await RunState.fromString(agent, JSON.stringify(json));
+      expect(restored._currentTurnInProgress).toBe(false);
+      expect(restored._conversationId).toBeUndefined();
+      expect(restored._previousResponseId).toBeUndefined();
+      const resumed = await run(agent, restored);
+      expect(resumed.finalOutput).toBe(first.finalOutput);
+    });
+
+    it('prefers runner trace config over RunState trace when resuming', async () => {
+      setTracingDisabled(false);
+      const provider = getGlobalTraceProvider();
+      const agent = new Agent({
+        name: 'ResumeTraceOverrides',
+        model: new FakeModel([
+          { output: [fakeModelMessage('hi')], usage: new Usage() },
+        ]),
+      });
+      const runner = new Runner({
+        traceId: 'override-trace-id',
+        workflowName: 'Override workflow',
+        groupId: 'override-group',
+        traceMetadata: { source: 'runner' },
+        tracing: { apiKey: 'override-key' },
+      });
+      const state = new RunState(new RunContext(), 'hi', agent, 1);
+      const trace = provider.createTrace({
+        traceId: 'original-trace-id',
+        name: 'Original workflow',
+        groupId: 'original-group',
+        metadata: { source: 'state' },
+        tracingApiKey: 'original-key',
+      });
+      const span = provider.createSpan(
+        { data: { type: 'agent', name: 'OriginalSpan' } },
+        trace,
+      );
+      state._trace = trace;
+      state._currentAgentSpan = span;
+
+      const resumed = await runner.run(agent, state);
+      expect(resumed.state._trace?.traceId).toBe('override-trace-id');
+      expect(resumed.state._trace?.name).toBe('Override workflow');
+      expect(resumed.state._trace?.groupId).toBe('override-group');
+      expect(resumed.state._trace?.metadata).toEqual({ source: 'runner' });
+      expect(resumed.state._trace?.tracingApiKey).toBe('override-key');
+      expect(resumed.state._currentAgentSpan?.traceId).toBe(
+        'override-trace-id',
+      );
+      expect(resumed.state._currentAgentSpan?.traceMetadata).toEqual({
+        source: 'runner',
+      });
+      expect(resumed.state._currentAgentSpan?.tracingApiKey).toBe(
+        'override-key',
+      );
+      setTracingDisabled(true);
+    });
+
+    it('input guardrail executes only once', async () => {
+      const firstResponse: ModelResponse = {
+        output: [
+          {
+            id: 'f1',
+            type: 'function_call',
+            name: 'test',
+            callId: 'c1',
+            status: 'completed',
+            arguments: '{}',
+          },
+        ],
+        usage: new Usage(),
+      };
+      const secondResponse: ModelResponse = {
+        output: [fakeModelMessage('done')],
+        usage: new Usage(),
+      };
+      const guardrailFn = vi.fn(async () => ({
+        tripwireTriggered: false,
+        outputInfo: {},
+      }));
+      const runner = new Runner({
+        inputGuardrails: [{ name: 'ig', execute: guardrailFn }],
+      });
+      const agent = new Agent({
+        name: 'Guard',
+        model: new FakeModel([firstResponse, secondResponse]),
+        tools: [TEST_TOOL],
+      });
+      const result = await runner.run(agent, 'start');
+      expect(result.finalOutput).toBe('done');
+      expect(guardrailFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('waits for blocking input guardrails before calling the model', async () => {
+      let guardrailCompleted = false;
+      const blockingGuardrail = {
+        name: 'blocking-ig',
+        runInParallel: false,
+        execute: vi.fn(async () => {
+          await Promise.resolve();
+          guardrailCompleted = true;
+          return { tripwireTriggered: false, outputInfo: {} };
+        }),
+      };
+
+      class ExpectGuardrailFirstModel implements Model {
+        calls = 0;
+
+        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+          this.calls++;
+          expect(guardrailCompleted).toBe(true);
+          return {
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          };
+        }
+
+        /* eslint-disable require-yield */
+        async *getStreamedResponse(_request: ModelRequest) {
+          throw new Error('not implemented');
+        }
+        /* eslint-enable require-yield */
+      }
+
+      const agent = new Agent({
+        name: 'BlockingGuard',
+        model: new ExpectGuardrailFirstModel(),
+        inputGuardrails: [blockingGuardrail],
+      });
+
+      const result = await run(agent, 'hello');
+      expect(result.finalOutput).toBe('done');
+      expect(result.inputGuardrailResults).toHaveLength(1);
+      expect(blockingGuardrail.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws InputGuardrailTripwireTriggered when parallel guardrail trips with structured output and model returns non-JSON', async () => {
+      const fakeModel = new FakeModel([
+        {
+          output: [fakeModelMessage('I am sorry, this is plain text not JSON')],
+          usage: new Usage(),
+        },
+      ]);
+
+      const agent = new Agent({
+        name: 'GuardrailPriority',
+        model: fakeModel,
+        outputType: z.object({ response: z.string() }),
+        inputGuardrails: [
+          {
+            name: 'slow-tripwire',
+            runInParallel: true,
+            execute: async () => {
+              await new Promise((r) => setTimeout(r, 50));
+              return {
+                tripwireTriggered: true,
+                outputInfo: { reason: 'blocked' },
+              };
+            },
+          },
+        ],
+      });
+
+      await expect(run(agent, 'test')).rejects.toBeInstanceOf(
+        InputGuardrailTripwireTriggered,
+      );
+    });
+
+    it('keeps the current agent span attached when an input guardrail trips', async () => {
+      setTracingDisabled(false);
+      const fakeModel = new FakeModel([
+        {
+          output: [fakeModelMessage('plain text')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'GuardrailSpan',
+        model: fakeModel,
+        inputGuardrails: [
+          {
+            name: 'tripwire',
+            runInParallel: false,
+            execute: async () => ({
+              tripwireTriggered: true,
+              outputInfo: { reason: 'blocked' },
+            }),
+          },
+        ],
+      });
+
+      try {
+        await run(agent, 'test');
+        throw new Error('Expected the input guardrail to trip.');
+      } catch (error) {
+        expect(error).toBeInstanceOf(InputGuardrailTripwireTriggered);
+        const tripwireError = error as InputGuardrailTripwireTriggered;
+        expect(tripwireError.state?._currentAgentSpan).toBeTruthy();
+        expect(tripwireError.state?._currentAgentSpan?.error).not.toBeNull();
+      } finally {
+        setTracingDisabled(true);
+      }
+    });
+
+    it('output guardrail success', async () => {
+      const guardrailFn = vi.fn(async () => ({
+        tripwireTriggered: false,
+        outputInfo: {},
+      }));
+      const runner = new Runner({
+        outputGuardrails: [{ name: 'og', execute: guardrailFn }],
+      });
+      const agent = new Agent({
+        name: 'Out',
+        model: new FakeModel([
+          { output: [fakeModelMessage('hi')], usage: new Usage() },
+        ]),
+      });
+      const result = await runner.run(agent, 'input');
+      expect(result.finalOutput).toBe('hi');
+      expect(guardrailFn).toHaveBeenCalledTimes(1);
+      expect(result.outputGuardrailResults).toHaveLength(1);
+      expect(result.outputGuardrailResults[0].guardrail.name).toBe('og');
+      expect(result.outputGuardrailResults[0].output.tripwireTriggered).toBe(
+        false,
+      );
+      expect(result.outputGuardrailResults[0].agentOutput).toBe('hi');
+      expect(result.outputGuardrailResults[0].agent).toBe(agent);
+    });
+
+    it('output guardrail tripwire throws', async () => {
+      const guardrailFn = vi.fn(async () => ({
+        tripwireTriggered: true,
+        outputInfo: { bad: true },
+      }));
+      const runner = new Runner({
+        outputGuardrails: [{ name: 'og', execute: guardrailFn }],
+      });
+      const agent = new Agent({
+        name: 'Out',
+        model: new FakeModel([
+          { output: [fakeModelMessage('x')], usage: new Usage() },
+        ]),
+      });
+      await expect(runner.run(agent, 'input')).rejects.toBeInstanceOf(
+        OutputGuardrailTripwireTriggered,
+      );
+    });
+
+    it('passes run details to output guardrails', async () => {
+      let receivedArgs: OutputGuardrailFunctionArgs | undefined;
+      let guardrailValidatedTool = false;
+      const guardrailFn = vi.fn(async (args: OutputGuardrailFunctionArgs) => {
+        receivedArgs = args;
+        const toolCall = args.details?.output?.find(
+          (item): item is protocol.FunctionCallItem =>
+            item.type === 'function_call' &&
+            (item as protocol.FunctionCallItem).name === 'queryPerson',
+        );
+        expect(toolCall?.arguments).toContain('person-1');
+        guardrailValidatedTool = true;
+        return { tripwireTriggered: false, outputInfo: {} };
+      });
+      const runner = new Runner({
+        outputGuardrails: [{ name: 'og', execute: guardrailFn }],
+      });
+      const queryPerson = tool({
+        name: 'queryPerson',
+        description: 'Look up a person by id',
+        parameters: z.object({ personId: z.string() }),
+        execute: async ({ personId }) => `${personId} result`,
+      });
+      const responses: ModelResponse[] = [
+        {
+          output: [
+            {
+              id: 'call-1',
+              type: 'function_call',
+              name: 'queryPerson',
+              callId: 'call-1',
+              status: 'completed',
+              arguments: '{"personId":"person-1"}',
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('done')],
+          usage: new Usage(),
+        },
+      ];
+      const agent = new Agent({
+        name: 'Out',
+        model: new FakeModel(responses),
+        tools: [queryPerson],
+      });
+
+      await runner.run(agent, 'input');
+
+      expect(guardrailFn).toHaveBeenCalledTimes(1);
+
+      const outputItems = receivedArgs?.details?.output ?? [];
+      expect(outputItems.length).toBeGreaterThan(0);
+      const toolCall = outputItems.find(
+        (item): item is protocol.FunctionCallItem =>
+          item.type === 'function_call' && (item as any).name === 'queryPerson',
+      );
+      expect(toolCall?.arguments).toContain('person-1');
+
+      const toolResult = outputItems.find(
+        (item): item is protocol.FunctionCallResultItem =>
+          item.type === 'function_call_result' &&
+          (item as any).callId === 'call-1',
+      );
+      expect(toolResult).toBeDefined();
+      const toolOutput = toolResult?.output;
+      if (typeof toolOutput === 'string') {
+        expect(toolOutput).toBe('person-1 result');
+      } else if (Array.isArray(toolOutput)) {
+        expect(
+          toolOutput.some(
+            (item) =>
+              'text' in item &&
+              typeof (item as { text?: unknown }).text === 'string' &&
+              (item as { text: string }).text === 'person-1 result',
+          ),
+        ).toBe(true);
+      } else {
+        expect((toolOutput as { text?: string } | undefined)?.text).toBe(
+          'person-1 result',
+        );
+      }
+      expect(guardrailValidatedTool).toBe(true);
+    });
+
+    it('executes tool calls and records output', async () => {
+      const first: ModelResponse = {
+        output: [
+          {
+            id: 't1',
+            type: 'function_call',
+            name: 'test',
+            callId: 'c1',
+            status: 'completed',
+            arguments: '{}',
+          },
+        ],
+        usage: new Usage(),
+      };
+      const second: ModelResponse = {
+        output: [fakeModelMessage('final')],
+        usage: new Usage(),
+      };
+      const agent = new Agent({
+        name: 'Tool',
+        model: new FakeModel([first, second]),
+        tools: [TEST_TOOL],
+      });
+      const result = await run(agent, 'do');
+      const types = result.newItems.map((i) => i.type);
+      expect(types).toContain('tool_call_item');
+      expect(types).toContain('tool_call_output_item');
+      expect(result.rawResponses.length).toBeGreaterThanOrEqual(2);
+      expect(result.finalOutput).toBe('final');
+    });
+
+    it('switches agents via handoff', async () => {
+      const agentB = new Agent({
+        name: 'B',
+        model: new FakeModel([
+          { output: [fakeModelMessage('done B')], usage: new Usage() },
+        ]),
+      });
+      const callItem: protocol.FunctionCallItem = {
+        id: 'h1',
+        type: 'function_call',
+        name: handoff(agentB).toolName,
+        callId: 'c1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'A',
+        model: new FakeModel([{ output: [callItem], usage: new Usage() }]),
+        handoffs: [handoff(agentB)],
+      });
+      const runner = new Runner();
+      const result = await runner.run(agentA, 'hi');
+      expect(result.finalOutput).toBe('done B');
+      expect(result.state._currentAgent).toBe(agentB);
+    });
+
+    it('does not keep ignored handoffs in history or session state', async () => {
+      class RecordingSession implements Session {
+        items: AgentInputItem[] = [];
+
+        async getSessionId(): Promise<string> {
+          return 'session';
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.items];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.items.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.items.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.items = [];
+        }
+      }
+
+      const agentB = new Agent({
+        name: 'B',
+        model: new FakeModel([
+          { output: [fakeModelMessage('done B')], usage: new Usage() },
+        ]),
+      });
+      const agentC = new Agent({
+        name: 'C',
+        model: new FakeModel([
+          { output: [fakeModelMessage('done C')], usage: new Usage() },
+        ]),
+      });
+      const handoffToB = handoff(agentB);
+      const handoffToC = handoff(agentC);
+      const acceptedCall: protocol.FunctionCallItem = {
+        id: 'h1',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'c1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const ignoredCall: protocol.FunctionCallItem = {
+        id: 'h2',
+        type: 'function_call',
+        name: handoffToC.toolName,
+        callId: 'c2',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const session = new RecordingSession();
+      const agentA = new Agent({
+        name: 'A',
+        model: new FakeModel([
+          { output: [acceptedCall, ignoredCall], usage: new Usage() },
+        ]),
+        handoffs: [handoffToB, handoffToC],
+      });
+
+      const result = await new Runner().run(agentA, 'hi', { session });
+      const persistedItems = await session.getItems();
+
+      expect(result.finalOutput).toBe('done B');
+      expect(
+        result.history.some(
+          (item) => (item as { callId?: string }).callId === ignoredCall.callId,
+        ),
+      ).toBe(false);
+      expect(
+        persistedItems.some(
+          (item) => (item as { callId?: string }).callId === ignoredCall.callId,
+        ),
+      ).toBe(false);
+      expect(
+        persistedItems.some(
+          (item) =>
+            (item as { callId?: string }).callId === acceptedCall.callId,
+        ),
+      ).toBe(true);
+    });
+
+    it('streamed run produces same final output', async () => {
+      const msg = fakeModelMessage('stream');
+      const agent1 = new Agent({ name: 'S1', model: new StreamingModel(msg) });
+      const agent2 = new Agent({ name: 'S2', model: new StreamingModel(msg) });
+      const streamRes = await run(agent1, 'hi', { stream: true });
+      const events: RunStreamEvent[] = [];
+      for await (const e of streamRes.toStream()) {
+        events.push(e);
+      }
+      await streamRes.completed;
+      const normalRes = await run(agent2, 'hi');
+      expect(streamRes.finalOutput).toBe(normalRes.finalOutput);
+      expect(streamRes.finalOutput).toBe('stream');
+      expect(events.length).toBeGreaterThan(0);
+    });
+
+    it('records one model response per turn', async () => {
+      const first: ModelResponse = {
+        output: [
+          {
+            id: 'rc1',
+            type: 'function_call',
+            name: 'test',
+            callId: 'c1',
+            status: 'completed',
+            arguments: '{}',
+          },
+        ],
+        usage: new Usage(),
+      };
+      const second: ModelResponse = {
+        output: [fakeModelMessage('end')],
+        usage: new Usage(),
+      };
+      const agent = new Agent({
+        name: 'Record',
+        model: new FakeModel([first, second]),
+        tools: [TEST_TOOL],
+      });
+      const result = await run(agent, 'go');
+      expect(result.state._modelResponses).toHaveLength(2);
+      expect(result.state._modelResponses[0]).toBe(first);
+      expect(result.state._modelResponses[1]).toBe(second);
+    });
+
+    it('records one model response per turn for streaming runs', async () => {
+      const first: ModelResponse = {
+        output: [
+          {
+            id: 'sc1',
+            type: 'function_call',
+            name: 'test',
+            callId: 'c1',
+            status: 'completed',
+            arguments: '{}',
+          },
+        ],
+        usage: new Usage(),
+      };
+      const second: ModelResponse = {
+        output: [fakeModelMessage('final')],
+        usage: new Usage(),
+      };
+      class SimpleStreamingModel implements Model {
+        constructor(private resps: ModelResponse[]) {}
+        async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+          const r = this.resps.shift();
+          if (!r) {
+            throw new Error('No response found');
+          }
+          return r;
+        }
+        async *getStreamedResponse(
+          req: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          const r = await this.getResponse(req);
+          yield {
+            type: 'response_done',
+            response: {
+              id: 'r',
+              usage: {
+                requests: 1,
+                inputTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+              },
+              output: r.output,
+            },
+          } as any;
+        }
+      }
+      const agent = new Agent({
+        name: 'StreamRecord',
+        model: new SimpleStreamingModel([first, second]),
+        tools: [TEST_TOOL],
+      });
+      const res = await run(agent, 'go', { stream: true });
+      for await (const _ of res.toStream()) {
+        // consume
+      }
+      await res.completed;
+      expect(res.state._modelResponses).toHaveLength(2);
+    });
+
+    it('max turn exceeded throws', async () => {
+      const agent = new Agent({
+        name: 'Max',
+        model: new FakeModel([
+          { output: [fakeModelMessage('nope')], usage: new Usage() },
+        ]),
+      });
+      await expect(run(agent, 'x', { maxTurns: 0 })).rejects.toBeInstanceOf(
+        MaxTurnsExceededError,
+      );
+    });
+
+    it('does not enforce maxTurns when maxTurns is null', async () => {
+      const toolResponses = Array.from({ length: 12 }, (_, index) => ({
+        output: [
+          {
+            ...TEST_MODEL_FUNCTION_CALL,
+            id: `fc_${index}`,
+            callId: `call_${index}`,
+            arguments: JSON.stringify({ test: 'input' }),
+          },
+        ],
+        usage: new Usage(),
+      }));
+      const agent = new Agent({
+        name: 'NoMaxTurns',
+        model: new FakeModel([
+          ...toolResponses,
+          { output: [fakeModelMessage('done')], usage: new Usage() },
+        ]),
+        tools: [TEST_TOOL],
+      });
+
+      const result = await run(agent, 'x', { maxTurns: null });
+
+      expect(result.finalOutput).toBe('done');
+      expect(result.state._maxTurns).toBeNull();
+      expect(result.state._currentTurn).toBe(13);
+    });
+
+    it('allows resumed states to disable maxTurns with null', async () => {
+      const responses = [
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'fc_1',
+              callId: 'call_1',
+              arguments: JSON.stringify({ test: 'first' }),
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'fc_2',
+              callId: 'call_2',
+              arguments: JSON.stringify({ test: 'second' }),
+            },
+          ],
+          usage: new Usage(),
+        },
+        { output: [fakeModelMessage('done')], usage: new Usage() },
+      ];
+      const agent = new Agent({
+        name: 'NoMaxTurnsResume',
+        model: new FakeModel(responses),
+        tools: [TEST_TOOL],
+      });
+      const error = await run(agent, 'x', { maxTurns: 1 }).catch((err) => err);
+      expect(error).toBeInstanceOf(MaxTurnsExceededError);
+      const state = (error as MaxTurnsExceededError).state as RunState<
+        unknown,
+        typeof agent
+      >;
+
+      const result = await run(agent, state, {
+        maxTurns: null,
+      });
+
+      expect(result.finalOutput).toBe('done');
+      expect(result.state._maxTurns).toBeNull();
+    });
+
+    it('max turn handler returns final output', async () => {
+      const agent = new Agent({
+        name: 'MaxSummary',
+        model: new FakeModel([
+          { output: [fakeModelMessage('nope')], usage: new Usage() },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        maxTurns: 0,
+        errorHandlers: {
+          maxTurns: ({ runData }) => ({
+            finalOutput: `summary:${runData.history.length}`,
+          }),
+        },
+      });
+      expect(result.finalOutput).toBe('summary:1');
+      expect(extractAllTextOutput(result.newItems)).toBe('summary:1');
+    });
+
+    it('max turn handler can skip history updates', async () => {
+      const agent = new Agent({
+        name: 'MaxSummaryNoHistory',
+        model: new FakeModel([
+          { output: [fakeModelMessage('nope')], usage: new Usage() },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        maxTurns: 0,
+        errorHandlers: {
+          maxTurns: () => ({
+            finalOutput: 'summary',
+            includeInHistory: false,
+          }),
+        },
+      });
+      expect(result.finalOutput).toBe('summary');
+      expect(result.newItems).toHaveLength(0);
+    });
+
+    it('throws model refusal errors instead of retrying refusal-only messages', async () => {
+      const agent = new Agent({
+        name: 'Refusal',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      await expect(run(agent, 'x', { maxTurns: 3 })).rejects.toMatchObject({
+        name: 'ModelRefusalError',
+        refusal: 'I cannot help with that request.',
+      });
+    });
+
+    it('throws model refusal errors before structured output parsing', async () => {
+      const agent = new Agent({
+        name: 'StructuredRefusalError',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      await expect(run(agent, 'x')).rejects.toBeInstanceOf(ModelRefusalError);
+    });
+
+    it('uses assistant text when a message also contains refusal content', async () => {
+      const agent = new Agent({
+        name: 'MixedTextRefusal',
+        model: new FakeModel([
+          {
+            output: [
+              fakeModelMessageWithRefusal(
+                'valid answer',
+                'I cannot help with a different part.',
+              ),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x');
+      expect(result.finalOutput).toBe('valid answer');
+    });
+
+    it('parses structured assistant text when refusal content is also present', async () => {
+      const agent = new Agent({
+        name: 'MixedStructuredRefusal',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [
+              fakeModelMessageWithRefusal(
+                '{"summary":"valid answer"}',
+                'I cannot help with a different part.',
+              ),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x');
+      expect(result.finalOutput).toEqual({ summary: 'valid answer' });
+    });
+
+    it('model refusal handler returns structured final output', async () => {
+      const agent = new Agent({
+        name: 'StructuredRefusal',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          modelRefusal: ({ error, runData }) => {
+            expect(error).toBeInstanceOf(ModelRefusalError);
+            expect((error as ModelRefusalError).refusal).toBe(
+              'I cannot help with that request.',
+            );
+            expect(runData.rawResponses).toHaveLength(1);
+            return { finalOutput: { summary: 'safe fallback' } };
+          },
+        },
+      });
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+      expect(extractAllTextOutput(result.newItems)).toBe(
+        '{"summary":"safe fallback"}',
+      );
+    });
+
+    it('model refusal handler can skip history updates', async () => {
+      const agent = new Agent({
+        name: 'RefusalNoHistory',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          modelRefusal: () => ({
+            finalOutput: 'safe fallback',
+            includeInHistory: false,
+          }),
+        },
+      });
+      expect(result.finalOutput).toBe('safe fallback');
+      expect(extractAllTextOutput(result.newItems)).toBe('');
+    });
+
+    it('default error handler can handle model refusals', async () => {
+      const agent = new Agent({
+        name: 'DefaultRefusal',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          default: ({ error }) => {
+            expect(error).toBeInstanceOf(ModelRefusalError);
+            return { finalOutput: 'safe fallback' };
+          },
+        },
+      });
+      expect(result.finalOutput).toBe('safe fallback');
+    });
+
+    it('enforces maxTurns across multiple model calls', async () => {
+      // Bug: After first model call, _lastTurnResponse is set, so turn counter never advances.
+      // With maxTurns=1, we should only allow 1 model call, but currently allows 2.
+      const testTool = tool({
+        name: 'test_tool',
+        description: 'A test tool',
+        parameters: z.object({}),
+        execute: async () => 'result',
+      });
+
+      const agent = new Agent({
+        name: 'TurnCounter',
+        model: new FakeModel([
+          // First call: tool call
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_1',
+                callId: 'call_1',
+                name: 'test_tool',
+                status: 'completed',
+                arguments: '{}',
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          // Second call: should be blocked by maxTurns=1
+          { output: [fakeModelMessage('second')], usage: new Usage() },
+        ]),
+        tools: [testTool],
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      // With maxTurns=1, this should throw MaxTurnsExceededError after the first model call
+      // Currently fails because turn counter doesn't advance after first call
+      await expect(run(agent, 'x', { maxTurns: 1 })).rejects.toBeInstanceOf(
+        MaxTurnsExceededError,
+      );
+    });
+
+    it('enforces maxTurns across resumed interruptions', async () => {
+      // Bug: After resuming from interruption, ALL subsequent calls are treated as same turn
+      // because _lastTurnResponse is still set. The first post-interruption call should NOT
+      // advance the turn, but the second call SHOULD advance the turn.
+      const testTool = tool({
+        name: 'test_tool',
+        description: 'A test tool',
+        parameters: z.object({}),
+        execute: async () => 'result',
+      });
+
+      const agent = new Agent({
+        name: 'ResumeTurnCounter',
+        model: new FakeModel([
+          // First post-interruption call: should NOT advance turn (still turn 1)
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_1',
+                callId: 'call_1',
+                name: 'test_tool',
+                status: 'completed',
+                arguments: '{}',
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          // Second call: SHOULD advance turn to 2, then maxTurns=1 should throw
+          { output: [fakeModelMessage('second')], usage: new Usage() },
+        ]),
+        tools: [testTool],
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      // Simulate a resumed state after an interruption
+      const resumedState = new RunState(new RunContext(), 'x', agent, 1);
+      resumedState._currentTurn = 1;
+      resumedState._currentTurnPersistedItemCount = 0;
+      resumedState._currentStep = { type: 'next_step_run_again' };
+      // Set these to simulate a state that was resumed from interruption
+      resumedState._lastTurnResponse = {
+        output: [fakeModelMessage('previous')],
+        usage: new Usage(),
+      };
+      resumedState._lastProcessedResponse = {
+        newItems: [],
+        functions: [],
+        computerActions: [],
+        shellActions: [],
+        applyPatchActions: [],
+        handoffs: [],
+        mcpApprovalRequests: [],
+        toolsUsed: [],
+      } as any;
+
+      // With maxTurns=1, after the first post-interruption call completes and tries to make
+      // a second call, the turn should advance to 2 and then throw MaxTurnsExceededError.
+      // Currently fails because turn counter doesn't advance after first post-interruption call.
+      await expect(
+        run(agent, resumedState, { maxTurns: 1 }),
+      ).rejects.toBeInstanceOf(MaxTurnsExceededError);
+    });
+
+    it('does not advance the turn when resuming an interruption without persisted items', async () => {
+      const approvalTool = tool({
+        name: 'get_weather',
+        description: 'Gets weather for a city.',
+        parameters: z.object({ city: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ city }) => `Weather in ${city}`,
+      });
+
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              type: 'function_call',
+              id: 'fc_1',
+              callId: 'call_weather_1',
+              name: 'get_weather',
+              status: 'completed',
+              arguments: JSON.stringify({ city: 'Seattle' }),
+              providerData: {},
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+        },
+        { output: [fakeModelMessage('All set.')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({
+        name: 'ApprovalResume',
+        model,
+        tools: [approvalTool],
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      let result = await run(agent, 'How is the weather?', { maxTurns: 1 });
+      expect(result.interruptions).toHaveLength(1);
+      expect(result.state._currentTurn).toBe(1);
+      expect(result.state._currentTurnPersistedItemCount).toBe(0);
+
+      result.state.approve(result.interruptions[0]);
+
+      result = await run(agent, result.state, { maxTurns: 1 });
+      expect(result.finalOutput).toBe('All set.');
+      expect(result.state._currentTurn).toBe(1);
+    });
+
+    it('does nothing when no input guardrails are configured', async () => {
+      setTracingDisabled(false);
+      setTraceProcessors([new BatchTraceProcessor(new FakeTracingExporter())]);
+      const agent = new Agent({
+        name: 'NoIG',
+        model: new FakeModel([
+          { output: [fakeModelMessage('ok')], usage: new Usage() },
+        ]),
+      });
+      const result = await run(agent, 'hi');
+      expect(result.inputGuardrailResults).toEqual([]);
+      expect(result.state._currentAgentSpan?.error).toBeNull();
+      setTracingDisabled(true);
+    });
+
+    it('does nothing when no output guardrails are configured', async () => {
+      setTracingDisabled(false);
+      const agent = new Agent({
+        name: 'NoOG',
+        model: new FakeModel([
+          { output: [fakeModelMessage('ok')], usage: new Usage() },
+        ]),
+      });
+      const spy = vi.spyOn(agent, 'processFinalOutput');
+      const result = await run(agent, 'input');
+      expect(result.outputGuardrailResults).toEqual([]);
+      expect(spy).not.toHaveBeenCalled();
+      expect(result.state._currentAgentSpan?.error).toBeNull();
+      setTracingDisabled(true);
+    });
+
+    it('getTurnInput assembles history correctly', () => {
+      const msgItem = new MessageOutputItem(
+        TEST_MODEL_MESSAGE,
+        new Agent({ name: 'X' }),
+      );
+      const result1 = getTurnInput('hello', [msgItem]);
+      expect(result1[0]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: 'hello',
+      });
+      expect(result1[1]).toEqual(msgItem.rawItem);
+      const result2 = getTurnInput(
+        [{ type: 'message', role: 'user', content: 'a' }],
+        [msgItem],
+      );
+      expect(result2[0]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: 'a',
+      });
+      expect(result2[1]).toEqual(msgItem.rawItem);
+    });
+
+    it('uses runner-level reasoningItemIdPolicy when building follow-up turn input', async () => {
+      class RequestRecordingModel implements Model {
+        readonly requests: ModelRequest[] = [];
+        #callCount = 0;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          if (this.#callCount++ === 0) {
+            return {
+              output: [
+                {
+                  type: 'reasoning',
+                  id: 'rs_first',
+                  content: [{ type: 'input_text', text: 'reasoning trace' }],
+                } satisfies protocol.ReasoningItem,
+                {
+                  type: 'function_call',
+                  id: 'fc_first',
+                  callId: 'call_first',
+                  name: 'echo_tool',
+                  status: 'completed',
+                  arguments: '{}',
+                } satisfies protocol.FunctionCallItem,
+              ],
+              usage: new Usage(),
+            };
+          }
+          return {
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          };
+        }
+
+        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new RequestRecordingModel();
+      const echoTool = tool({
+        name: 'echo_tool',
+        description: 'Echoes a static payload.',
+        parameters: z.object({}),
+        execute: async () => 'ok',
+      });
+      const agent = new Agent({
+        name: 'ReasoningPolicyAgent',
+        model,
+        tools: [echoTool],
+      });
+      const runner = new Runner({
+        reasoningItemIdPolicy: 'omit',
+      });
+
+      const result = await runner.run(agent, 'hello');
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondRequestReasoning = getRequestInputItems(
+        model.requests[1],
+      ).find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(secondRequestReasoning).toBeDefined();
+      expect(secondRequestReasoning).not.toHaveProperty('id');
+
+      const historyReasoning = result.history.find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(historyReasoning).toBeDefined();
+      expect(historyReasoning).not.toHaveProperty('id');
+    });
+
+    it('allows per-run reasoningItemIdPolicy to override runner defaults', async () => {
+      class RequestRecordingModel implements Model {
+        readonly requests: ModelRequest[] = [];
+        #callCount = 0;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          if (this.#callCount++ === 0) {
+            return {
+              output: [
+                {
+                  type: 'reasoning',
+                  id: 'rs_override',
+                  content: [{ type: 'input_text', text: 'reasoning trace' }],
+                } satisfies protocol.ReasoningItem,
+                {
+                  type: 'function_call',
+                  id: 'fc_override',
+                  callId: 'call_override',
+                  name: 'echo_tool',
+                  status: 'completed',
+                  arguments: '{}',
+                } satisfies protocol.FunctionCallItem,
+              ],
+              usage: new Usage(),
+            };
+          }
+          return {
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          };
+        }
+
+        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new RequestRecordingModel();
+      const echoTool = tool({
+        name: 'echo_tool',
+        description: 'Echoes a static payload.',
+        parameters: z.object({}),
+        execute: async () => 'ok',
+      });
+      const agent = new Agent({
+        name: 'ReasoningPolicyOverrideAgent',
+        model,
+        tools: [echoTool],
+      });
+      const runner = new Runner({
+        reasoningItemIdPolicy: 'preserve',
+      });
+
+      await runner.run(agent, 'hello', {
+        reasoningItemIdPolicy: 'omit',
+      });
+
+      const secondRequestReasoning = getRequestInputItems(
+        model.requests[1],
+      ).find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(secondRequestReasoning).toBeDefined();
+      expect(secondRequestReasoning).not.toHaveProperty('id');
+    });
+
+    it('passes reasoningItemIdPolicy through the run() helper', async () => {
+      class RequestRecordingModel implements Model {
+        readonly requests: ModelRequest[] = [];
+        #callCount = 0;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          if (this.#callCount++ === 0) {
+            return {
+              output: [
+                {
+                  type: 'reasoning',
+                  id: 'rs_helper',
+                  content: [{ type: 'input_text', text: 'reasoning trace' }],
+                } satisfies protocol.ReasoningItem,
+                {
+                  type: 'function_call',
+                  id: 'fc_helper',
+                  callId: 'call_helper',
+                  name: 'echo_tool',
+                  status: 'completed',
+                  arguments: '{}',
+                } satisfies protocol.FunctionCallItem,
+              ],
+              usage: new Usage(),
+            };
+          }
+          return {
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          };
+        }
+
+        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new RequestRecordingModel();
+      const echoTool = tool({
+        name: 'echo_tool',
+        description: 'Echoes a static payload.',
+        parameters: z.object({}),
+        execute: async () => 'ok',
+      });
+      const agent = new Agent({
+        name: 'ReasoningPolicyHelperAgent',
+        model,
+        tools: [echoTool],
+      });
+
+      await run(agent, 'hello', {
+        reasoningItemIdPolicy: 'omit',
+      });
+
+      const secondRequestReasoning = getRequestInputItems(
+        model.requests[1],
+      ).find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(secondRequestReasoning).toBeDefined();
+      expect(secondRequestReasoning).not.toHaveProperty('id');
+    });
+
+    it('uses serialized reasoningItemIdPolicy when resuming without override', async () => {
+      class RequestRecordingModel implements Model {
+        readonly requests: ModelRequest[] = [];
+        #callCount = 0;
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          if (this.#callCount++ === 0) {
+            return {
+              output: [
+                {
+                  type: 'reasoning',
+                  id: 'rs_resume',
+                  content: [{ type: 'input_text', text: 'reasoning trace' }],
+                } satisfies protocol.ReasoningItem,
+                {
+                  type: 'function_call',
+                  id: 'fc_resume',
+                  callId: 'call_resume',
+                  name: 'approval_tool',
+                  status: 'completed',
+                  arguments: '{}',
+                } satisfies protocol.FunctionCallItem,
+              ],
+              usage: new Usage(),
+            };
+          }
+          return {
+            output: [fakeModelMessage('done')],
+            usage: new Usage(),
+          };
+        }
+
+        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new RequestRecordingModel();
+      const approvalTool = tool({
+        name: 'approval_tool',
+        description: 'Requires approval before execution.',
+        parameters: z.object({}),
+        needsApproval: true,
+        execute: async () => 'ok',
+      });
+      const agent = new Agent({
+        name: 'ReasoningPolicyResumeAgent',
+        model,
+        tools: [approvalTool],
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      const firstRun = await run(agent, 'hello', {
+        reasoningItemIdPolicy: 'omit',
+        maxTurns: 1,
+      });
+      expect(firstRun.interruptions).toHaveLength(1);
+      firstRun.state.approve(firstRun.interruptions[0]);
+
+      const restoredState = await RunState.fromString(
+        agent,
+        firstRun.state.toString(),
+      );
+      const resumedRun = await run(agent, restoredState, { maxTurns: 1 });
+
+      expect(resumedRun.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+      const secondRequestReasoning = getRequestInputItems(
+        model.requests[1],
+      ).find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(secondRequestReasoning).toBeDefined();
+      expect(secondRequestReasoning).not.toHaveProperty('id');
+    });
+
+    it('run() helper reuses underlying runner', async () => {
+      const spy = vi.spyOn(Runner.prototype, 'run');
+      const agentA = new Agent({ name: 'AA' });
+      const agentB = new Agent({ name: 'BB' });
+      await run(agentA, '1');
+      await run(agentB, '2');
+      expect(spy.mock.instances[0]).toBe(spy.mock.instances[1]);
+      spy.mockRestore();
+    });
+
+    describe('sessions', () => {
+      class MemorySession implements Session {
+        #history: AgentInputItem[];
+        #added: AgentInputItem[][] = [];
+        sessionId?: string;
+
+        constructor(history: AgentInputItem[] = []) {
+          this.#history = [...history];
+        }
+
+        get added(): AgentInputItem[][] {
+          return this.#added;
+        }
+
+        async getSessionId(): Promise<string> {
+          if (!this.sessionId) {
+            this.sessionId = 'conv_test';
+          }
+          return this.sessionId;
+        }
+
+        async getItems(limit?: number): Promise<AgentInputItem[]> {
+          if (limit == null) {
+            return [...this.#history];
+          }
+          return this.#history.slice(-limit);
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.#added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+          this.sessionId = undefined;
+        }
+      }
+
+      class RecordingModel extends FakeModel {
+        lastRequest: ModelRequest | undefined;
+
+        override async getResponse(
+          request: ModelRequest,
+        ): Promise<ModelResponse> {
+          this.lastRequest = request;
+          return super.getResponse(request);
+        }
+      }
+
+      it('uses session history and stores run results', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'SessionAgent', model });
+        const historyItem = fakeModelMessage(
+          'earlier message',
+        ) as AgentInputItem;
+        const session = new MemorySession([historyItem]);
+        const runner = new Runner();
+
+        await runner.run(agent, 'How are you?', { session });
+
+        const recordedInput = model.lastRequest?.input as AgentInputItem[];
+        expect(Array.isArray(recordedInput)).toBe(true);
+        expect(recordedInput[0]).toEqual(historyItem);
+        expect(recordedInput[1]).toMatchObject({
+          role: 'user',
+          content: 'How are you?',
+        });
+
+        expect(session.added).toHaveLength(1);
+        expect(session.added[0][0]).toMatchObject({
+          role: 'user',
+          content: 'How are you?',
+        });
+        expect(session.added[0][1]).toMatchObject({ role: 'assistant' });
+        const savedAssistant = session
+          .added[0][1] as protocol.AssistantMessageItem;
+        const firstPart = Array.isArray(savedAssistant.content)
+          ? (savedAssistant.content[0] as { providerData?: unknown })
+          : undefined;
+        expect(firstPart?.providerData).toEqual({ annotations: [] });
+      });
+
+      it('applies runner-level reasoningItemIdPolicy to replayed session history', async () => {
+        class ReasoningPreservingSession extends MemorySession {
+          preserveReasoningItemIdsForPersistence(): boolean {
+            return true;
+          }
+        }
+
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'SessionReasoningAgent', model });
+        const session = new ReasoningPreservingSession([
+          {
+            id: 'rs_persisted',
+            type: 'reasoning',
+            content: [{ type: 'input_text', text: 'stored reasoning' }],
+          },
+        ]);
+        const runner = new Runner({ reasoningItemIdPolicy: 'omit' });
+
+        await runner.run(agent, 'new input', { session });
+
+        expect(model.lastRequest).toBeDefined();
+        const reasoningItem = getRequestInputItems(model.lastRequest!).find(
+          (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+        );
+        expect(reasoningItem).toEqual({
+          type: 'reasoning',
+          content: [{ type: 'input_text', text: 'stored reasoning' }],
+        });
+      });
+
+      it('allows list inputs with session history and no session input callback', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('list response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'ListSession', model });
+        const historyItem = user('History stays');
+        const session = new MemorySession([historyItem]);
+        const runner = new Runner();
+
+        await runner.run(agent, [user('Hello')], { session });
+
+        const recordedInput = model.lastRequest?.input as AgentInputItem[];
+        expect(Array.isArray(recordedInput)).toBe(true);
+        expect(recordedInput).toHaveLength(2);
+        expect(getFirstTextContent(recordedInput[0])).toBe('History stays');
+        expect(getFirstTextContent(recordedInput[1])).toBe('Hello');
+
+        expect(session.added).toHaveLength(1);
+        expect(getFirstTextContent(session.added[0][0])).toBe('Hello');
+        expect(
+          session.added[0][1] &&
+            typeof session.added[0][1] === 'object' &&
+            'type' in session.added[0][1],
+        ).toBe(true);
+      });
+
+      it('allows list inputs when session input callback is provided', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'SessionCallbackAgent', model });
+        const sessionHistory: AgentInputItem[] = [
+          user('Keep this history item'),
+          assistant('Drop this assistant reply'),
+        ];
+        const session = new MemorySession([...sessionHistory]);
+        const runner = new Runner({
+          sessionInputCallback: (history, newItems) => {
+            return history
+              .filter(
+                (item) =>
+                  item.type === 'message' &&
+                  'role' in item &&
+                  item.role === 'user',
+              )
+              .concat(newItems);
+          },
+        });
+
+        await runner.run(agent, [user('New message')], { session });
+
+        const recordedInput = model.lastRequest?.input as AgentInputItem[];
+        expect(Array.isArray(recordedInput)).toBe(true);
+        expect(recordedInput).toHaveLength(2);
+        expect(
+          recordedInput[0].type === 'message' &&
+            'role' in recordedInput[0] &&
+            recordedInput[0].role,
+        ).toBe('user');
+        expect(getFirstTextContent(recordedInput[0])).toBe(
+          'Keep this history item',
+        );
+        expect(
+          recordedInput[1].type === 'message' &&
+            'role' in recordedInput[1] &&
+            recordedInput[1].role,
+        ).toBe('user');
+        expect(getFirstTextContent(recordedInput[1])).toBe('New message');
+      });
+
+      it('supports async session input callback', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'AsyncSessionCallback', model });
+        const session = new MemorySession([
+          user('Older message'),
+          user('Newest history'),
+        ]);
+        const runner = new Runner();
+
+        await runner.run(agent, [user('Fresh input')], {
+          session,
+          sessionInputCallback: async (history, newItems) => {
+            await Promise.resolve();
+            return history.slice(-1).concat(newItems);
+          },
+        });
+
+        const recordedInput = model.lastRequest?.input as AgentInputItem[];
+        expect(Array.isArray(recordedInput)).toBe(true);
+        expect(recordedInput).toHaveLength(2);
+        expect(getFirstTextContent(recordedInput[0])).toBe('Newest history');
+        expect(getFirstTextContent(recordedInput[1])).toBe('Fresh input');
+      });
+
+      it('persists transformed session input from callback', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('session response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'SessionTransform', model });
+        const session = new MemorySession();
+        const runner = new Runner();
+        const original = 'Sensitive payload';
+        const redacted = '[redacted]';
+
+        await runner.run(agent, original, {
+          session,
+          sessionInputCallback: (history, newItems) => {
+            expect(history).toHaveLength(0);
+            if (newItems[0] && typeof newItems[0] === 'object') {
+              (newItems[0] as protocol.UserMessageItem).content = redacted;
+            }
+            return history.concat(newItems);
+          },
+        });
+
+        const recordedInput = model.lastRequest?.input as AgentInputItem[];
+        expect(recordedInput[recordedInput.length - 1]).toMatchObject({
+          role: 'user',
+          content: redacted,
+        });
+
+        expect(session.added).toHaveLength(1);
+        const persistedTurn = session.added[0];
+        expect(persistedTurn[0]).toMatchObject({
+          role: 'user',
+          content: redacted,
+        });
+      });
+
+      it('does not persist duplicate user input when a model retry succeeds in the same run', async () => {
+        class RetryRecordingModel extends FakeModel {
+          requests: ModelRequest[] = [];
+          attempts = 0;
+
+          override async getResponse(
+            request: ModelRequest,
+          ): Promise<ModelResponse> {
+            this.requests.push({
+              ...request,
+              input: Array.isArray(request.input)
+                ? (JSON.parse(
+                    JSON.stringify(request.input),
+                  ) as AgentInputItem[])
+                : request.input,
+            });
+            this.attempts += 1;
+
+            if (this.attempts === 1) {
+              const error = new Error('temporary failure');
+              (error as Error & { statusCode?: number }).statusCode = 503;
+              throw error;
+            }
+
+            return await super.getResponse(request);
+          }
+        }
+
+        const model = new RetryRecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('retry response')],
+            usage: new Usage({ requests: 1 }),
+          },
+        ]);
+        const agent = new Agent({
+          name: 'RetrySessionAgent',
+          model,
+          modelSettings: {
+            retry: {
+              maxRetries: 1,
+              backoff: { initialDelayMs: 0, jitter: false },
+              policy: ({ normalized }) => normalized.statusCode === 503,
+            },
+          },
+        });
+        const session = new MemorySession();
+        const runner = new Runner();
+
+        const result = await runner.run(agent, 'Retry me once', { session });
+
+        expect(result.finalOutput).toBe('retry response');
+        expect(model.attempts).toBe(2);
+        expect(model.requests).toHaveLength(2);
+        expect(
+          getFirstTextContent(getRequestInputItems(model.requests[0])[0]!),
+        ).toBe('Retry me once');
+        expect(
+          getFirstTextContent(getRequestInputItems(model.requests[1])[0]!),
+        ).toBe('Retry me once');
+
+        expect(session.added).toHaveLength(1);
+        const persistedTexts = session.added[0]
+          .map((item) => getFirstTextContent(item))
+          .filter((text): text is string => typeof text === 'string');
+        expect(
+          persistedTexts.filter((text) => text === 'Retry me once'),
+        ).toHaveLength(1);
+        expect(result.state.usage.requests).toBe(2);
+      });
+
+      it('does not duplicate history when callback clones entries', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('clone response')],
+          },
+        ]);
+        const history = [user('Existing history item')];
+        const session = new MemorySession(history);
+        const agent = new Agent({ name: 'CloneSession', model });
+        const runner = new Runner();
+
+        await runner.run(agent, [user('Fresh input')], {
+          session,
+          sessionInputCallback: (incomingHistory, newItems) => {
+            const clonedHistory = incomingHistory.map((item) =>
+              structuredClone(item),
+            );
+            const clonedNewItems = newItems.map((item) =>
+              structuredClone(item),
+            );
+            return clonedHistory.concat(clonedNewItems);
+          },
+        });
+
+        expect(session.added).toHaveLength(1);
+        const [persistedItems] = session.added;
+        const persistedUsers = persistedItems.filter(
+          (item): item is protocol.UserMessageItem =>
+            item.type === 'message' && 'role' in item && item.role === 'user',
+        );
+        expect(persistedUsers).toHaveLength(1);
+        expect(getFirstTextContent(persistedUsers[0])).toBe('Fresh input');
+      });
+
+      it('persists reordered new items ahead of matching history', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('reordered response')],
+          },
+        ]);
+        const historyMessage = user('Repeatable message');
+        const newMessage = user('Repeatable message');
+        const session = new MemorySession([historyMessage]);
+        const agent = new Agent({ name: 'ReorderedSession', model });
+        const runner = new Runner({
+          sessionInputCallback: (history, newItems) => newItems.concat(history),
+        });
+
+        await runner.run(agent, [newMessage], { session });
+
+        expect(session.added).toHaveLength(1);
+        const [persisted] = session.added;
+        const persistedUsers = persisted.filter(
+          (item): item is protocol.UserMessageItem =>
+            item.type === 'message' && 'role' in item && item.role === 'user',
+        );
+        expect(persistedUsers).toHaveLength(1);
+        expect(getFirstTextContent(persistedUsers[0])).toBe(
+          'Repeatable message',
+        );
+      });
+
+      it('persists binary payloads that share prefixes with history', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('binary response')],
+          },
+        ]);
+        const historyPayload = new Uint8Array(32);
+        const newPayload = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) {
+          const value = i < 20 ? 0xaa : i;
+          historyPayload[i] = value;
+          newPayload[i] = value;
+        }
+        historyPayload[31] = 0xbb;
+        newPayload[31] = 0xcc;
+
+        const session = new MemorySession([
+          user('History with binary', { payload: historyPayload }),
+        ]);
+        const agent = new Agent({ name: 'BinarySession', model });
+        const runner = new Runner();
+
+        await runner.run(agent, [user('Binary input')], {
+          session,
+          sessionInputCallback: (history, newItems) => {
+            const clonedHistory = history.map((item) => structuredClone(item));
+            const updatedNewItems = newItems.map((item) => {
+              const cloned = structuredClone(item);
+              cloned.providerData = { payload: newPayload };
+              return cloned;
+            });
+            return clonedHistory.concat(updatedNewItems);
+          },
+        });
+
+        expect(session.added).toHaveLength(1);
+        const [persistedItems] = session.added;
+        const persistedPayloads = persistedItems
+          .filter(
+            (item): item is protocol.UserMessageItem =>
+              item.type === 'message' &&
+              'role' in item &&
+              item.role === 'user' &&
+              item.providerData?.payload,
+          )
+          .map((item) => item.providerData?.payload);
+        const expectedNewPayload = `data:text/plain;base64,${Buffer.from(newPayload).toString('base64')}`;
+        const expectedHistoryPayload = `data:text/plain;base64,${Buffer.from(historyPayload).toString('base64')}`;
+        expect(persistedPayloads).toContain(expectedNewPayload);
+        expect(persistedPayloads).not.toContain(expectedHistoryPayload);
+      });
+
+      it('throws when session input callback returns invalid data', async () => {
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'InvalidCallback', model });
+        const session = new MemorySession([user('history')]);
+        const runner = new Runner();
+
+        await expect(
+          runner.run(agent, 'Hello', {
+            session,
+            sessionInputCallback: () =>
+              'not-an-array' as unknown as AgentInputItem[],
+          }),
+        ).rejects.toThrow(
+          'Session input callback must return an array of AgentInputItem objects.',
+        );
+      });
+
+      it('stores function tool call and structured output in session', async () => {
+        const functionCall: protocol.FunctionCallItem = {
+          type: 'function_call',
+          callId: 'call-weather',
+          name: 'weather_lookup',
+          status: 'completed',
+          arguments: JSON.stringify({ city: 'San Francisco' }),
+          providerData: { source: 'openai' },
+        } as protocol.FunctionCallItem;
+
+        const model = new FakeModel([
+          {
+            output: [functionCall],
+            usage: new Usage(),
+          },
+          {
+            output: [fakeModelMessage('Weather retrieved.')],
+            usage: new Usage(),
+          },
+        ]);
+
+        const weatherTool = tool({
+          name: 'weather_lookup',
+          description: 'Looks up weather information',
+          parameters: z.object({ city: z.string() }),
+          execute: async ({ city }) => [
+            {
+              type: 'text',
+              text: `Weather for ${city}`,
+            },
+          ],
+        });
+
+        const agent = new Agent({
+          name: 'FunctionToolAgent',
+          model,
+          tools: [weatherTool],
+        });
+
+        const session = new MemorySession();
+        const runner = new Runner();
+
+        await runner.run(agent, 'What is the weather in San Francisco?', {
+          session,
+        });
+
+        expect(session.added).toHaveLength(1);
+        const savedItems = session.added[0];
+        expect(savedItems).toHaveLength(4);
+        const savedFunctionCall = savedItems[1] as protocol.FunctionCallItem;
+        expect(savedFunctionCall.providerData).toEqual({ source: 'openai' });
+        expect(savedFunctionCall.arguments).toBe(
+          JSON.stringify({ city: 'San Francisco' }),
+        );
+        const savedResult = savedItems[2] as protocol.FunctionCallResultItem & {
+          output: protocol.ToolCallStructuredOutput[];
+        };
+        expect(Array.isArray(savedResult.output)).toBe(true);
+        expect(savedResult.output[0]).toMatchObject({
+          type: 'input_text',
+          text: 'Weather for San Francisco',
+        });
+      });
+
+      it('stores hosted tool call metadata when approval is required', async () => {
+        const hostedCall: protocol.HostedToolCallItem = {
+          type: 'hosted_tool_call',
+          id: 'approval-1',
+          name: 'mcp_approval_request',
+          status: 'completed',
+          providerData: {
+            type: 'mcp_approval_request',
+            server_label: 'demo_server',
+            name: 'file_search',
+            id: 'approval-1',
+            arguments: '{"query":"invoices"}',
+          },
+        } as protocol.HostedToolCallItem;
+
+        const model = new FakeModel([
+          {
+            output: [hostedCall],
+            usage: new Usage(),
+          },
+        ]);
+
+        const hostedTool = hostedMcpTool({
+          serverLabel: 'demo_server',
+          serverUrl: 'https://example.com',
+          requireApproval: {
+            always: { toolNames: ['file_search'] },
+          },
+        });
+
+        const agent = new Agent({
+          name: 'HostedToolAgent',
+          model,
+          tools: [hostedTool],
+        });
+
+        const session = new MemorySession();
+        const runner = new Runner();
+
+        const result = await runner.run(agent, 'Find latest invoices', {
+          session,
+        });
+
+        expect(result.interruptions).toHaveLength(1);
+        expect(session.added).toHaveLength(1);
+        const savedItems = session.added[0];
+        expect(savedItems).toHaveLength(2);
+        const savedHostedCall = savedItems[1] as protocol.HostedToolCallItem & {
+          providerData: Record<string, unknown>;
+        };
+        expect(savedHostedCall.providerData).toEqual(hostedCall.providerData);
+        expect(savedHostedCall.id).toBe('approval-1');
+      });
+
+      it('prevents duplicate function_call items when resuming from interruption after tool approval', async () => {
+        // Regression test for issue #701
+        //
+        // Bug: When resuming a turn after approving a tool call, duplicate function_call items
+        // were saved to the session. The bug occurred because _currentTurnPersistedItemCount
+        // was incorrectly reset to 0 after resolveInterruptedTurn returned next_step_run_again,
+        // causing saveToSession to save all items from the beginning of the turn, including
+        // the already-persisted function_call item.
+        //
+        // Expected behavior: Only 1 function_call item should be saved to the session.
+        // Buggy behavior: 2 function_call items (duplicate) were saved.
+        //
+        // Test scenario:
+        // 1. Initial run with tool requiring approval creates an interruption
+        // 2. Tool call is approved
+        // 3. Run is resumed with the approved state
+        // 4. Session should contain exactly 1 function_call item (not 2)
+
+        const getWeatherTool = tool({
+          name: 'get_weather',
+          description: 'Get weather for a city',
+          parameters: z.object({ city: z.string() }),
+          needsApproval: async () => true, // Require approval for all calls
+          execute: async ({ city }) => `Sunny, 72°F in ${city}`,
+        });
+
+        const model = new FakeModel([
+          // First response: tool call that requires approval
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_1',
+                callId: 'call_weather_1',
+                name: 'get_weather',
+                status: 'completed',
+                arguments: JSON.stringify({ city: 'Oakland' }),
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          // Second response: after approval, final answer
+          {
+            output: [fakeModelMessage('The weather is sunny in Oakland.')],
+            usage: new Usage(),
+          },
+        ]);
+
+        const agent = new Agent({
+          name: 'Assistant',
+          instructions: 'Use get_weather tool to answer weather questions.',
+          model,
+          tools: [getWeatherTool],
+          toolUseBehavior: 'run_llm_again', // Must use 'run_llm_again' so resolveInterruptedTurn returns next_step_run_again
+        });
+
+        const session = new MemorySession();
+
+        // Use sessionInputCallback to match the scenario from issue #701
+        const sessionInputCallback = async (
+          historyItems: AgentInputItem[],
+          newItems: AgentInputItem[],
+        ) => {
+          return [...historyItems, ...newItems];
+        };
+
+        // Step 1: Initial run creates an interruption for tool approval
+        let result = await run(
+          agent,
+          [{ role: 'user', content: "What's the weather in Oakland?" }],
+          { session, sessionInputCallback },
+        );
+
+        // Step 2: Approve the tool call
+        for (const interruption of result.interruptions || []) {
+          result.state.approve(interruption);
+        }
+
+        // Step 3: Resume the run with the approved state
+        // Note: No sessionInputCallback on resume - this is part of the bug scenario
+        result = await run(agent, result.state, { session });
+
+        // Step 4: Verify only one function_call item exists in the session
+        const allItems = await session.getItems();
+        const functionCalls = allItems.filter(
+          (item): item is protocol.FunctionCallItem =>
+            item.type === 'function_call' && item.callId === 'call_weather_1',
+        );
+
+        // The bug would cause 2 function_call items to be saved (duplicate)
+        // The fix ensures only 1 function_call item is saved
+        expect(functionCalls).toHaveLength(1);
+      });
+
+      it('does not duplicate already persisted items when the resumed run continues into additional turns', async () => {
+        // Regression test for session persistence across resumed runs that execute additional turns.
+        //
+        // Scenario:
+        // 1. First run is interrupted for tool approval, persisting the initial function_call.
+        // 2. The run is resumed and continues into another tool call (additional turn).
+        //
+        // Expected behavior: Session history must not contain duplicate function_call items from the
+        // already-persisted portion of the run.
+
+        const getWeatherTool = tool({
+          name: 'get_weather',
+          description: 'Get weather for a city',
+          parameters: z.object({ city: z.string() }),
+          needsApproval: async () => true,
+          execute: async ({ city }) => `Sunny, 72°F in ${city}`,
+        });
+
+        const getTimeTool = tool({
+          name: 'get_time',
+          description: 'Get the current time for a city',
+          parameters: z.object({ city: z.string() }),
+          execute: async ({ city }) => `12:00PM in ${city}`,
+        });
+
+        const model = new FakeModel([
+          // First response: tool call that requires approval.
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_1',
+                callId: 'call_weather_1',
+                name: 'get_weather',
+                status: 'completed',
+                arguments: JSON.stringify({ city: 'Oakland' }),
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          // Second response: after approval, request another tool call without approval.
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_2',
+                callId: 'call_time_1',
+                name: 'get_time',
+                status: 'completed',
+                arguments: JSON.stringify({ city: 'Oakland' }),
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          // Third response: final answer after tool results are available.
+          {
+            output: [
+              fakeModelMessage('It is sunny in Oakland and it is noon.'),
+            ],
+            usage: new Usage(),
+          },
+        ]);
+
+        const agent = new Agent({
+          name: 'Assistant',
+          instructions:
+            'Use get_weather and get_time tools to answer questions about Oakland.',
+          model,
+          tools: [getWeatherTool, getTimeTool],
+          toolUseBehavior: 'run_llm_again',
+        });
+
+        const session = new MemorySession();
+
+        const sessionInputCallback = async (
+          historyItems: AgentInputItem[],
+          newItems: AgentInputItem[],
+        ) => {
+          return [...historyItems, ...newItems];
+        };
+
+        // Step 1: Initial run creates an interruption for tool approval.
+        let result = await run(
+          agent,
+          [
+            {
+              role: 'user',
+              content: "What's the weather and time in Oakland?",
+            },
+          ],
+          { session, sessionInputCallback },
+        );
+
+        for (const interruption of result.interruptions || []) {
+          result.state.approve(interruption);
+        }
+
+        // Step 2: Resume the run; it continues into another turn due to a second tool call.
+        result = await run(agent, result.state, { session });
+
+        const allItems = await session.getItems();
+        const weatherCalls = allItems.filter(
+          (item): item is protocol.FunctionCallItem =>
+            item.type === 'function_call' && item.callId === 'call_weather_1',
+        );
+
+        expect(weatherCalls).toHaveLength(1);
+      });
+    });
+  });
+
+  describe('callModelInputFilter', () => {
+    class FilterTrackingModel extends FakeModel {
+      lastRequest?: ModelRequest;
+
+      override async getResponse(
+        request: ModelRequest,
+      ): Promise<ModelResponse> {
+        this.lastRequest = request;
+        return await super.getResponse(request);
+      }
+    }
+
+    class FilterStreamingModel implements Model {
+      lastRequest?: ModelRequest;
+
+      constructor(private readonly response: ModelResponse) {}
+
+      async getResponse(request: ModelRequest): Promise<ModelResponse> {
+        this.lastRequest = request;
+        return this.response;
+      }
+
+      async *getStreamedResponse(
+        request: ModelRequest,
+      ): AsyncIterable<protocol.StreamEvent> {
+        this.lastRequest = request;
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'stream-filter',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: this.response.output,
+          },
+        } as protocol.StreamEvent;
+      }
+    }
+
+    it('modifies model input for non-streaming runs', async () => {
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('filtered result')],
+        },
+      ]);
+      const agent = new Agent({
+        name: 'FilterAgent',
+        instructions: 'Base instructions',
+        model,
+      });
+
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => {
+          return {
+            instructions: `${modelData.instructions ?? ''} ::filtered`,
+            input: modelData.input.slice(-1),
+          };
+        },
+      });
+
+      await runner.run(agent, [user('First input'), user('Second input')]);
+
+      expect(model.lastRequest?.systemInstructions).toBe(
+        'Base instructions ::filtered',
+      );
+      const sentInput = model.lastRequest?.input as AgentInputItem[];
+      expect(Array.isArray(sentInput)).toBe(true);
+      expect(sentInput).toHaveLength(1);
+      expect(
+        sentInput[0].type === 'message' &&
+          'role' in sentInput[0] &&
+          sentInput[0].role,
+      ).toBe('user');
+      expect(getFirstTextContent(sentInput[0])).toBe('Second input');
+    });
+
+    it('supports async filters for streaming runs', async () => {
+      const streamingModel = new FilterStreamingModel({
+        output: [fakeModelMessage('stream response')],
+        usage: new Usage(),
+      });
+      const agent = new Agent({
+        name: 'StreamFilterAgent',
+        instructions: 'Stream instructions',
+        model: streamingModel,
+      });
+
+      const runner = new Runner({
+        callModelInputFilter: async ({ modelData }) => {
+          await Promise.resolve();
+          return {
+            instructions: `${modelData.instructions ?? ''} ::stream`,
+            input: modelData.input.slice(0, 1),
+          };
+        },
+      });
+
+      const result = await runner.run(agent, [user('Alpha'), user('Beta')], {
+        stream: true,
+      });
+
+      const events: RunStreamEvent[] = [];
+      for await (const e of result.toStream()) {
+        events.push(e);
+      }
+      await result.completed;
+
+      expect(streamingModel.lastRequest?.systemInstructions).toBe(
+        'Stream instructions ::stream',
+      );
+      const streamInput = streamingModel.lastRequest?.input as AgentInputItem[];
+      expect(Array.isArray(streamInput)).toBe(true);
+      expect(streamInput).toHaveLength(1);
+      expect(
+        streamInput[0].type === 'message' &&
+          'role' in streamInput[0] &&
+          streamInput[0].role,
+      ).toBe('user');
+      expect(getFirstTextContent(streamInput[0])).toBe('Alpha');
+    });
+
+    it('does not mutate run history when filter mutates input items', async () => {
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'HistoryFilterAgent',
+        model,
+      });
+
+      const originalText = 'Top secret message';
+      const redactedText = '[redacted]';
+
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => {
+          const first = modelData.input[0];
+          if (
+            first?.type === 'message' &&
+            Array.isArray(first.content) &&
+            first.content.length > 0
+          ) {
+            const firstChunk = first.content[0] as { text?: string };
+            if (firstChunk) {
+              firstChunk.text = redactedText;
+            }
+          }
+          return modelData;
+        },
+      });
+
+      const result = await runner.run(agent, [user(originalText)]);
+
+      const sentInput = model.lastRequest?.input as AgentInputItem[];
+      expect(Array.isArray(sentInput)).toBe(true);
+      expect(getFirstTextContent(sentInput[0])).toBe(redactedText);
+
+      const history = result.history;
+      expect(getFirstTextContent(history[0])).toBe(originalText);
+    });
+
+    it('does not duplicate existing session history when filters run', async () => {
+      class TrackingSession implements Session {
+        #history: AgentInputItem[];
+        added: AgentInputItem[][] = [];
+        sessionId?: string;
+
+        constructor(history: AgentInputItem[]) {
+          this.#history = [...history];
+          this.sessionId = 'filter-session';
+        }
+
+        async getSessionId(): Promise<string> {
+          if (!this.sessionId) {
+            this.sessionId = 'filter-session';
+          }
+          return this.sessionId;
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+          this.sessionId = undefined;
+        }
+      }
+
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'FilterSessionAgent',
+        model,
+      });
+      const historyMessage = user('Persisted history');
+      const session = new TrackingSession([historyMessage]);
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => ({
+          instructions: modelData.instructions,
+          input: modelData.input,
+        }),
+      });
+
+      await runner.run(agent, 'Fresh input', { session });
+
+      expect(session.added).toHaveLength(1);
+      const [persisted] = session.added;
+      const persistedUsers = persisted.filter(
+        (item) => 'role' in item && item.role === 'user',
+      );
+      expect(persistedUsers).toHaveLength(1);
+      const persistedTexts = persistedUsers
+        .map((item) => {
+          if ('content' in item && typeof item.content === 'string') {
+            return item.content;
+          }
+          return getFirstTextContent(item);
+        })
+        .filter((text): text is string => typeof text === 'string');
+      expect(persistedTexts).toContain('Fresh input');
+      expect(persistedTexts).not.toContain('Persisted history');
+    });
+
+    it('does not persist raw inputs when filters drop every item', async () => {
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+        #sessionId: string | undefined = 'empty-filter-session';
+
+        async getSessionId(): Promise<string> {
+          if (!this.#sessionId) {
+            this.#sessionId = 'empty-filter-session';
+          }
+          return this.#sessionId;
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+          this.#sessionId = undefined;
+        }
+      }
+
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'EmptyFilterAgent',
+        model,
+      });
+      const session = new RecordingSession();
+
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => ({
+          instructions: modelData.instructions,
+          input: [],
+        }),
+      });
+
+      const secret = 'sensitive payload';
+      const result = await runner.run(agent, secret, { session });
+
+      expect(result.finalOutput).toBe('Hello World');
+      expect(model.lastRequest?.input).toEqual([]);
+
+      expect(session.added).toHaveLength(1);
+      const persisted = session.added[0];
+      const persistedTexts = persisted
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(persistedTexts).not.toContain(secret);
+      const userItems = persisted.filter(
+        (item) => 'role' in item && item.role === 'user',
+      );
+      expect(userItems).toHaveLength(0);
+    });
+
+    it('resets per-turn persistence when resuming from a prior run state', async () => {
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+
+        async getSessionId(): Promise<string> {
+          return 'persist-reset-session';
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+        }
+      }
+
+      const model = new FakeModel([
+        { output: [fakeModelMessage('first turn')], usage: new Usage() },
+        { output: [fakeModelMessage('second turn')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({ name: 'PersistCounterAgent', model });
+      const session = new RecordingSession();
+      const runner = new Runner();
+
+      const firstRun = await runner.run(agent, 'hello', { session });
+
+      expect(firstRun.state._currentTurnPersistedItemCount).toBe(1);
+
+      const resumedState = firstRun.state;
+      resumedState._originalInput = 'follow-up';
+      resumedState._currentStep = { type: 'next_step_run_again' } as const;
+      resumedState._lastTurnResponse = undefined;
+      resumedState._lastProcessedResponse = undefined;
+      resumedState._noActiveAgentRun = true;
+      resumedState._currentTurnPersistedItemCount = 5;
+
+      const secondRun = await runner.run(agent, resumedState, { session });
+
+      expect(secondRun.finalOutput).toBe('second turn');
+      expect(session.added.length).toBeGreaterThanOrEqual(2);
+      const newlyPersisted = session.added[session.added.length - 1];
+      const texts = newlyPersisted
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(texts).toContain('second turn');
+    });
+
+    it('does not double-count turns when resuming an in-progress turn', async () => {
+      const model = new FakeModel([
+        { output: [fakeModelMessage('done')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({ name: 'TurnResumeAgent', model });
+      const runner = new Runner();
+
+      const state = new RunState(new RunContext(), 'hi', agent, 1);
+      state._currentTurn = 1;
+      (state as any)._currentTurnInProgress = true;
+      state._currentStep = { type: 'next_step_run_again' } as const;
+
+      const result = await runner.run(agent, state);
+
+      expect(result.state._currentTurn).toBe(1);
+      expect(result.finalOutput).toBe('done');
+    });
+
+    it('advances turns after resuming an in-progress turn that continues', async () => {
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+
+        async getSessionId(): Promise<string> {
+          return 'resume-in-progress-session';
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+        }
+      }
+
+      const model = new FakeModel([
+        { output: [{ ...TEST_MODEL_FUNCTION_CALL }], usage: new Usage() },
+        { output: [fakeModelMessage('second turn')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({
+        name: 'ResumeInProgressContinueAgent',
+        model,
+        tools: [TEST_TOOL],
+      });
+      const runner = new Runner();
+      const session = new RecordingSession();
+
+      const state = new RunState(new RunContext(), 'hi', agent, 2);
+      state._currentTurn = 1;
+      (state as any)._currentTurnInProgress = true;
+      state._currentStep = { type: 'next_step_run_again' } as const;
+      state._noActiveAgentRun = true;
+
+      const result = await runner.run(agent, state, { session });
+
+      expect(result.finalOutput).toBe('second turn');
+      expect(result.state._currentTurn).toBe(2);
+      expect(session.added.length).toBeGreaterThan(0);
+      const newlyPersisted = session.added[session.added.length - 1];
+      const texts = newlyPersisted
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(texts).toContain('second turn');
+    });
+
+    it('clears stale per-turn persistence when a resumed run advances to a new turn', async () => {
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+
+        async getSessionId(): Promise<string> {
+          return 'resume-in-progress-reset-session';
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+        }
+      }
+
+      const model = new FakeModel([
+        { output: [{ ...TEST_MODEL_FUNCTION_CALL }], usage: new Usage() },
+        { output: [fakeModelMessage('second turn')], usage: new Usage() },
+      ]);
+
+      const agent = new Agent({
+        name: 'ResumeInProgressResetAgent',
+        model,
+        tools: [TEST_TOOL],
+      });
+      const runner = new Runner();
+      const session = new RecordingSession();
+
+      const state = new RunState(new RunContext(), 'hi', agent, 2);
+      state._currentTurn = 1;
+      (state as any)._currentTurnInProgress = true;
+      state._currentStep = { type: 'next_step_run_again' } as const;
+      state._noActiveAgentRun = true;
+      // Simulate a stale persisted count from the resumed turn so new turns reset it.
+      state._currentTurnPersistedItemCount = 5;
+
+      const result = await runner.run(agent, state, { session });
+
+      expect(result.finalOutput).toBe('second turn');
+      expect(result.state._currentTurn).toBe(2);
+      const newlyPersisted = session.added[session.added.length - 1];
+      const texts = newlyPersisted
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(texts).toContain('second turn');
+    });
+
+    it('keeps original inputs when filters prepend new items', async () => {
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+        #sessionId: string | undefined = 'prepended-filter-session';
+
+        async getSessionId(): Promise<string> {
+          if (!this.#sessionId) {
+            this.#sessionId = 'prepended-filter-session';
+          }
+          return this.#sessionId;
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+          this.#sessionId = undefined;
+        }
+      }
+
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'PrependedFilterAgent',
+        model,
+      });
+      const session = new RecordingSession();
+
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => ({
+          instructions: modelData.instructions,
+          input: [assistant('primer'), ...modelData.input],
+        }),
+      });
+
+      await runner.run(agent, 'Persist me', { session });
+
+      expect(session.added).toHaveLength(1);
+      const [persisted] = session.added;
+      const persistedTexts = persisted
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(persistedTexts).toContain('Persist me');
+    });
+
+    it('throws when filter returns invalid data', async () => {
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'InvalidFilterAgent',
+        model,
+      });
+      const runner = new Runner({
+        callModelInputFilter: () =>
+          ({
+            instructions: 'invalid',
+          }) as unknown as ModelInputData,
+      });
+
+      await expect(runner.run(agent, 'Hello')).rejects.toThrow(
+        'ModelInputData',
+      );
+    });
+
+    it('prefers per-run callModelInputFilter over runner config', async () => {
+      const model = new FilterTrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+        },
+      ]);
+      const agent = new Agent({
+        name: 'OverrideFilterAgent',
+        model,
+      });
+
+      const defaultFilter = vi.fn(({ modelData }) => ({
+        instructions: `${modelData.instructions ?? ''} default`,
+        input: modelData.input,
+      }));
+      const overrideFilter = vi.fn((payload) => ({
+        instructions: 'override instructions',
+        input: payload.modelData.input,
+      }));
+
+      const runner = new Runner({
+        callModelInputFilter: defaultFilter,
+      });
+
+      const context = { tenant: 'acme' };
+
+      await runner.run(agent, 'Hello override', {
+        callModelInputFilter: overrideFilter,
+        context,
+      });
+
+      expect(defaultFilter).not.toHaveBeenCalled();
+      expect(overrideFilter).toHaveBeenCalledTimes(1);
+      const args = overrideFilter.mock.calls[0][0];
+      expect(args.context).toEqual(context);
+
+      expect(model.lastRequest?.systemInstructions).toBe(
+        'override instructions',
+      );
+      const sentInput = model.lastRequest?.input as AgentInputItem[];
+      expect(Array.isArray(sentInput)).toBe(true);
+      expect(sentInput).toHaveLength(1);
+      expect(getFirstTextContent(sentInput[0])).toBe('Hello override');
+    });
+
+    it('allows callModelInputFilter to override omitted reasoning IDs', async () => {
+      class ReasoningTrackingModel extends FakeModel {
+        requests: ModelRequest[] = [];
+
+        override async getResponse(
+          request: ModelRequest,
+        ): Promise<ModelResponse> {
+          const cloned: ModelRequest = {
+            ...request,
+            input: Array.isArray(request.input)
+              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
+              : request.input,
+          };
+          this.requests.push(cloned);
+          return await super.getResponse(request);
+        }
+      }
+
+      const model = new ReasoningTrackingModel([
+        {
+          output: [
+            {
+              type: 'reasoning',
+              id: 'rs_filter',
+              content: [{ type: 'input_text', text: 'thinking...' }],
+            } as protocol.ReasoningItem,
+            {
+              type: 'function_call',
+              id: 'fc_filter',
+              callId: 'call_filter',
+              name: 'echo_tool',
+              status: 'completed',
+              arguments: '{}',
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('done')],
+          usage: new Usage(),
+        },
+      ]);
+
+      const echoTool = tool({
+        name: 'echo_tool',
+        description: 'Echoes a static payload.',
+        parameters: z.object({}),
+        execute: async () => 'ok',
+      });
+      const agent = new Agent({
+        name: 'ReasoningFilterOverrideAgent',
+        model,
+        tools: [echoTool],
+      });
+
+      const runner = new Runner({
+        reasoningItemIdPolicy: 'omit',
+        callModelInputFilter: ({ modelData }) => ({
+          instructions: modelData.instructions,
+          input: modelData.input.map((item) => {
+            if (item.type !== 'reasoning' || 'id' in item) {
+              return item;
+            }
+            return { ...item, id: 'rs_reintroduced' } as protocol.ReasoningItem;
+          }),
+        }),
+      });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(Array.isArray(secondInput)).toBe(true);
+      const secondReasoning = secondInput.find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(secondReasoning).toBeDefined();
+      expect(secondReasoning?.id).toBe('rs_reintroduced');
+
+      const historyReasoning = result.history.find(
+        (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+      );
+      expect(historyReasoning).toBeDefined();
+      expect(historyReasoning).not.toHaveProperty('id');
+    });
+
+    it('keeps server conversation tracking aligned with filtered inputs', async () => {
+      class ConversationTrackingModel implements Model {
+        requests: ModelRequest[] = [];
+
+        constructor(private readonly responses: ModelResponse[]) {}
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          const cloned: ModelRequest = {
+            ...request,
+            input: Array.isArray(request.input)
+              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
+              : request.input,
+          };
+          this.requests.push(cloned);
+          const response = this.responses.shift();
+          if (!response) {
+            throw new Error('No response configured');
+          }
+          return response;
+        }
+
+        getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new ConversationTrackingModel([
+        {
+          output: [
+            fakeModelMessage('call the tool'),
+            {
+              id: 'call-1',
+              type: 'function_call',
+              name: 'filterTool',
+              callId: 'call-1',
+              status: 'completed',
+              arguments: JSON.stringify({ test: 'value' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+          responseId: 'resp-1',
+        },
+        {
+          output: [fakeModelMessage('all done')],
+          usage: new Usage(),
+          responseId: 'resp-2',
+        },
+      ]);
+
+      const filterTool = tool({
+        name: 'filterTool',
+        description: 'test tool',
+        parameters: z.object({ test: z.string() }),
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      let filterCalls = 0;
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => {
+          filterCalls += 1;
+          if (filterCalls === 1) {
+            return {
+              instructions: modelData.instructions,
+              input: modelData.input
+                .slice(1)
+                .map((item) => structuredClone(item)),
+            };
+          }
+          return modelData;
+        },
+      });
+
+      const agent = new Agent({
+        name: 'TrackerFilterAgent',
+        model,
+        tools: [filterTool],
+      });
+
+      const result = await runner.run(
+        agent,
+        [user('First input'), user('Second input')],
+        { conversationId: 'conv-filter-tracker' },
+      );
+
+      expect(result.finalOutput).toBe('all done');
+      expect(filterCalls).toBe(2);
+      expect(model.requests).toHaveLength(2);
+
+      const firstInput = model.requests[0].input as AgentInputItem[];
+      expect(Array.isArray(firstInput)).toBe(true);
+      expect(firstInput).toHaveLength(1);
+      expect(getFirstTextContent(firstInput[0])).toBe('Second input');
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(Array.isArray(secondInput)).toBe(true);
+      const secondMessages = secondInput.filter(
+        (item) => item.type === 'message',
+      );
+      expect(secondMessages).toHaveLength(0);
+
+      expect(
+        secondInput.some(
+          (item) =>
+            item.type === 'function_call_result' &&
+            (item as protocol.FunctionCallResultItem).callId === 'call-1',
+        ),
+      ).toBe(true);
+    });
+
+    it('stops requeuing sanitized inputs when filters replace them', async () => {
+      class RedactionTrackingModel implements Model {
+        requests: ModelRequest[] = [];
+
+        constructor(private readonly responses: ModelResponse[]) {}
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          const cloned: ModelRequest = {
+            ...request,
+            input: Array.isArray(request.input)
+              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
+              : request.input,
+          };
+          this.requests.push(cloned);
+          const response = this.responses.shift();
+          if (!response) {
+            throw new Error('No response configured');
+          }
+          return response;
+        }
+
+        getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new RedactionTrackingModel([
+        {
+          output: [
+            fakeModelMessage('call the tool'),
+            {
+              id: 'call-1',
+              type: 'function_call',
+              name: 'filterTool',
+              callId: 'call-1',
+              status: 'completed',
+              arguments: JSON.stringify({ test: 'value' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+          responseId: 'resp-redact-1',
+        },
+        {
+          output: [fakeModelMessage('all done')],
+          usage: new Usage(),
+          responseId: 'resp-redact-2',
+        },
+      ]);
+
+      const filterTool = tool({
+        name: 'filterTool',
+        description: 'test tool',
+        parameters: z.object({ test: z.string() }),
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      let filterCalls = 0;
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => {
+          filterCalls += 1;
+          if (filterCalls === 1) {
+            return {
+              instructions: modelData.instructions,
+              input: modelData.input.map((item) => {
+                if (
+                  item?.type === 'message' &&
+                  'role' in item &&
+                  item.role === 'user'
+                ) {
+                  const clone = structuredClone(item);
+                  if (typeof clone.content === 'string') {
+                    clone.content = '[redacted]';
+                  } else if (Array.isArray(clone.content)) {
+                    const firstChunk = clone.content[0] as { text?: string };
+                    if (firstChunk) {
+                      firstChunk.text = '[redacted]';
+                    }
+                  }
+                  return clone;
+                }
+                return structuredClone(item);
+              }),
+            };
+          }
+          return modelData;
+        },
+      });
+
+      const agent = new Agent({
+        name: 'RedactionFilterAgent',
+        model,
+        tools: [filterTool],
+      });
+
+      const result = await runner.run(agent, [user('Sensitive payload')], {
+        conversationId: 'conv-filter-redact',
+      });
+
+      expect(result.finalOutput).toBe('all done');
+      expect(filterCalls).toBe(2);
+      expect(model.requests).toHaveLength(2);
+
+      const firstInput = model.requests[0].input as AgentInputItem[];
+      expect(Array.isArray(firstInput)).toBe(true);
+      expect(getFirstTextContent(firstInput[0])).toBe('[redacted]');
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      const secondTexts = secondInput
+        .map((item) => getFirstTextContent(item))
+        .filter((text): text is string => typeof text === 'string');
+      expect(secondTexts).not.toContain('[redacted]');
+      expect(secondTexts).not.toContain('Sensitive payload');
+    });
+
+    it('does not requeue filtered tool outputs in server-managed conversations', async () => {
+      class ConversationTrackingModel implements Model {
+        requests: ModelRequest[] = [];
+
+        constructor(private readonly responses: ModelResponse[]) {}
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          const cloned: ModelRequest = {
+            ...request,
+            input: Array.isArray(request.input)
+              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
+              : request.input,
+          };
+          this.requests.push(cloned);
+          const response = this.responses.shift();
+          if (!response) {
+            throw new Error('No response configured');
+          }
+          return response;
+        }
+
+        getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new ConversationTrackingModel([
+        {
+          output: [
+            {
+              id: 'call-1',
+              type: 'function_call',
+              name: 'filterTool',
+              callId: 'call-1',
+              status: 'completed',
+              arguments: JSON.stringify({ test: 'first' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+          responseId: 'resp-1',
+        },
+        {
+          output: [
+            {
+              id: 'call-2',
+              type: 'function_call',
+              name: 'filterTool',
+              callId: 'call-2',
+              status: 'completed',
+              arguments: JSON.stringify({ test: 'second' }),
+            } as protocol.FunctionCallItem,
+          ],
+          usage: new Usage(),
+          responseId: 'resp-2',
+        },
+        {
+          output: [fakeModelMessage('all done')],
+          usage: new Usage(),
+          responseId: 'resp-3',
+        },
+      ]);
+
+      const filterTool = tool({
+        name: 'filterTool',
+        description: 'test tool',
+        parameters: z.object({ test: z.string() }),
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      let filterCalls = 0;
+      const runner = new Runner({
+        callModelInputFilter: ({ modelData }) => {
+          filterCalls += 1;
+          if (filterCalls === 2) {
+            return {
+              instructions: modelData.instructions,
+              input: modelData.input.filter(
+                (item) => item.type !== 'function_call_result',
+              ),
+            };
+          }
+          return modelData;
+        },
+      });
+
+      const agent = new Agent({
+        name: 'ToolOutputFilterAgent',
+        model,
+        tools: [filterTool],
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      const result = await runner.run(agent, [user('Run it')], {
+        conversationId: 'conv-filter-tool-output',
+      });
+
+      expect(result.finalOutput).toBe('all done');
+      expect(filterCalls).toBe(3);
+      expect(model.requests).toHaveLength(3);
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(Array.isArray(secondInput)).toBe(true);
+      expect(
+        secondInput.some(
+          (item) =>
+            item.type === 'function_call_result' &&
+            (item as protocol.FunctionCallResultItem).callId === 'call-1',
+        ),
+      ).toBe(false);
+
+      const thirdInput = model.requests[2].input as AgentInputItem[];
+      expect(Array.isArray(thirdInput)).toBe(true);
+      const toolResults = thirdInput.filter(
+        (item): item is protocol.FunctionCallResultItem =>
+          item.type === 'function_call_result',
+      );
+      const callIds = toolResults.map((item) => item.callId);
+      expect(callIds).toContain('call-2');
+      expect(callIds).not.toContain('call-1');
+    });
+
+    it('preserves providerData when saving streaming session items', async () => {
+      class MetadataStreamingModel implements Model {
+        constructor(private readonly response: ModelResponse) {}
+
+        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+          return this.response;
+        }
+
+        async *getStreamedResponse(
+          _request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          yield {
+            type: 'response_done',
+            response: {
+              id: 'meta-stream',
+              usage: {
+                requests: 1,
+                inputTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+              },
+              output: this.response.output,
+            },
+          } as protocol.StreamEvent;
+        }
+      }
+
+      const assistantMessage: protocol.AssistantMessageItem = {
+        ...fakeModelMessage('assistant with metadata'),
+        providerData: { annotations: ['keep-me'] },
+      };
+      const model = new MetadataStreamingModel({
+        output: [assistantMessage],
+        usage: new Usage(),
+      });
+
+      const agent = new Agent({
+        name: 'StreamSessionMetadata',
+        model,
+      });
+
+      class RecordingSession implements Session {
+        #history: AgentInputItem[] = [];
+        added: AgentInputItem[][] = [];
+        sessionId = 'stream-session';
+
+        async getSessionId(): Promise<string> {
+          return this.sessionId;
+        }
+
+        async getItems(): Promise<AgentInputItem[]> {
+          return [...this.#history];
+        }
+
+        async addItems(items: AgentInputItem[]): Promise<void> {
+          this.added.push(items);
+          this.#history.push(...items);
+        }
+
+        async popItem(): Promise<AgentInputItem | undefined> {
+          return this.#history.pop();
+        }
+
+        async clearSession(): Promise<void> {
+          this.#history = [];
+        }
+      }
+
+      const session = new RecordingSession();
+      const runner = new Runner();
+
+      const result = await runner.run(agent, 'Hi stream', {
+        stream: true,
+        session,
+      });
+
+      for await (const _event of result.toStream()) {
+        // exhaust stream so the run finishes
+      }
+      await result.completed;
+
+      expect(session.added).toHaveLength(2);
+      const streamedItems = session.added[1];
+      expect(streamedItems).toHaveLength(1);
+      const savedAssistant = streamedItems[0] as protocol.AssistantMessageItem;
+      expect(savedAssistant.providerData).toEqual({ annotations: ['keep-me'] });
+      expect(getFirstTextContent(savedAssistant)).toBe(
+        'assistant with metadata',
+      );
+    });
+  });
+
+  describe('gpt-5 default model adjustments', () => {
+    class InspectableModel extends FakeModel {
+      lastRequest: ModelRequest | undefined;
+
+      constructor(response: ModelResponse) {
+        super([response]);
+      }
+
+      override async getResponse(
+        request: ModelRequest,
+      ): Promise<ModelResponse> {
+        this.lastRequest = request;
+        return await super.getResponse(request);
+      }
+    }
+
+    class InspectableModelProvider implements ModelProvider {
+      constructor(private readonly model: Model) {}
+
+      async getModel(_name: string): Promise<Model> {
+        return this.model;
+      }
+    }
+
+    let originalDefaultModel: string | undefined;
+
+    beforeEach(() => {
+      originalDefaultModel = process.env.OPENAI_DEFAULT_MODEL;
+      process.env.OPENAI_DEFAULT_MODEL = 'gpt-5o';
+    });
+
+    afterEach(() => {
+      if (originalDefaultModel === undefined) {
+        delete process.env.OPENAI_DEFAULT_MODEL;
+      } else {
+        process.env.OPENAI_DEFAULT_MODEL = originalDefaultModel;
+      }
+    });
+
+    function createGpt5ModelSettings(): ModelSettings {
+      return {
+        temperature: 0.42,
+        providerData: {
+          reasoning: { effort: 'high' },
+          text: { verbosity: 'high' },
+          reasoning_effort: 'medium',
+          keep: 'value',
+        },
+        reasoning: { effort: 'high', summary: 'detailed' },
+        text: { verbosity: 'medium' },
+      };
+    }
+
+    it('strips GPT-5-only settings when the RunConfig model is not a GPT-5 string', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello non GPT-5')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const agent = new Agent({
+        name: 'NonGpt5Runner',
+        model: inspectableModel,
+        modelSettings: createGpt5ModelSettings(),
+      });
+
+      const runner = new Runner();
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello non GPT-5');
+      expect(inspectableModel.lastRequest).toBeDefined();
+
+      const requestSettings = inspectableModel.lastRequest!.modelSettings;
+      expect(requestSettings.temperature).toBe(0.42);
+      expect(requestSettings.providerData?.keep).toBe('value');
+      expect(requestSettings.providerData?.reasoning).toBeUndefined();
+      expect(requestSettings.providerData?.text?.verbosity).toBeUndefined();
+      expect(
+        (requestSettings.providerData as any)?.reasoning_effort,
+      ).toBeUndefined();
+      expect(requestSettings.reasoning?.effort).toBeUndefined();
+      expect(requestSettings.reasoning?.summary).toBeUndefined();
+      expect(requestSettings.text?.verbosity).toBeUndefined();
+    });
+
+    it('keeps GPT-5-only settings when the agent relies on the default model', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello default GPT-5')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const runner = new Runner({
+        modelProvider: new InspectableModelProvider(inspectableModel),
+      });
+
+      const agent = new Agent({
+        name: 'DefaultModelAgent',
+        modelSettings: createGpt5ModelSettings(),
+      });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello default GPT-5');
+      expect(inspectableModel.lastRequest).toBeDefined();
+
+      const requestSettings = inspectableModel.lastRequest!.modelSettings;
+      expect(requestSettings.providerData?.reasoning).toEqual({
+        effort: 'high',
+      });
+      expect(requestSettings.providerData?.text?.verbosity).toBe('high');
+      expect((requestSettings.providerData as any)?.reasoning_effort).toBe(
+        'medium',
+      );
+      expect(requestSettings.reasoning?.effort).toBe('high');
+      expect(requestSettings.reasoning?.summary).toBe('detailed');
+      expect(requestSettings.text?.verbosity).toBe('medium');
+    });
+
+    it('uses model-specific defaults when the RunConfig model is explicit', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello explicit runner GPT-5')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const runner = new Runner({
+        model: 'gpt-5',
+        modelProvider: new InspectableModelProvider(inspectableModel),
+      });
+      const agent = new Agent({ name: 'RunnerModelAgent' });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello explicit runner GPT-5');
+      expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
+        reasoning: { effort: 'low' },
+        text: { verbosity: 'low' },
+      });
+    });
+
+    it('lets RunConfig modelSettings override implicit model defaults', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello runner override')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const runner = new Runner({
+        model: 'gpt-5',
+        modelProvider: new InspectableModelProvider(inspectableModel),
+        modelSettings: {
+          reasoning: { effort: 'medium' },
+          temperature: 0.7,
+        },
+      });
+      const agent = new Agent({ name: 'RunnerModelSettingsAgent' });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello runner override');
+      expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
+        reasoning: { effort: 'medium' },
+        text: { verbosity: 'low' },
+        temperature: 0.7,
+      });
+    });
+  });
+
+  describe('server-managed conversation state', () => {
+    type TurnResponse = ModelResponse;
+
+    class RecordingSession implements Session {
+      public added: AgentInputItem[][] = [];
+
+      async getSessionId(): Promise<string> {
+        return 'server-managed-session';
+      }
+
+      async getItems(): Promise<AgentInputItem[]> {
+        return [];
+      }
+
+      async addItems(items: AgentInputItem[]): Promise<void> {
+        this.added.push(items);
+      }
+
+      async popItem(): Promise<AgentInputItem | undefined> {
+        return undefined;
+      }
+
+      async clearSession(): Promise<void> {
+        this.added = [];
+      }
+    }
+
+    class TrackingModel implements Model {
+      public requests: ModelRequest[] = [];
+      public firstRequest: ModelRequest | undefined;
+      public lastRequest: ModelRequest | undefined;
+
+      constructor(private readonly responses: TurnResponse[]) {}
+
+      private recordRequest(request: ModelRequest) {
+        const clonedInput: string | AgentInputItem[] =
+          typeof request.input === 'string'
+            ? request.input
+            : (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[]);
+
+        const recorded: ModelRequest = {
+          ...request,
+          input: clonedInput,
+        };
+
+        this.requests.push(recorded);
+        this.lastRequest = recorded;
+        this.firstRequest ??= recorded;
+      }
+
+      async getResponse(request: ModelRequest): Promise<ModelResponse> {
+        this.recordRequest(request);
+        const response = this.responses.shift();
+        if (!response) {
+          throw new Error('No response configured');
+        }
+        return response;
+      }
+
+      getStreamedResponse(
+        _request: ModelRequest,
+      ): AsyncIterable<protocol.StreamEvent> {
+        throw new Error('Not implemented');
+      }
+    }
+
+    const buildResponse = (
+      items: protocol.ModelItem[],
+      responseId?: string,
+    ): ModelResponse => ({
+      output: JSON.parse(JSON.stringify(items)) as protocol.ModelItem[],
+      usage: new Usage(),
+      responseId,
+    });
+
+    const buildToolCall = (
+      callId: string,
+      arg: string,
+    ): protocol.FunctionCallItem => ({
+      id: callId,
+      type: 'function_call',
+      name: 'test',
+      callId,
+      status: 'completed',
+      arguments: JSON.stringify({ test: arg }),
+    });
+
+    const serverTool = tool({
+      name: 'test',
+      description: 'test tool',
+      parameters: z.object({ test: z.string() }),
+      execute: async ({ test }) => `result:${test}`,
+    });
+
+    it('marks server-managed inputs as sent only after a successful response', async () => {
+      /* eslint-disable require-yield */
+      class SingleResponseModel implements Model {
+        public readonly requests: ModelRequest[] = [];
+        constructor(private readonly response: ModelResponse) {}
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          return this.response;
+        }
+
+        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
+          throw new Error('not used');
+        }
+      }
+      /* eslint-enable require-yield */
+
+      const markSpy = vi.spyOn(
+        ServerConversationTracker.prototype,
+        'markInputAsSent',
+      );
+
+      const model = new SingleResponseModel(TEST_MODEL_RESPONSE_BASIC);
+      const agent = new Agent({ name: 'MarkSuccess', model });
+      const runner = new Runner();
+
+      const result = await runner.run(agent, 'hi there', {
+        conversationId: 'conv-mark-success',
+      });
+
+      expect(result.finalOutput).toBe('Hello World');
+      expect(markSpy).toHaveBeenCalledTimes(1);
+      const [sourceItems, options] = markSpy.mock.calls[0];
+      expect(Array.isArray(sourceItems)).toBe(true);
+      expect(options?.filterApplied).toBe(false);
+      expect(model.requests[0]?.conversationId).toBe('conv-mark-success');
+
+      markSpy.mockRestore();
+    });
+
+    it('does not mark server inputs as sent when the model call fails before sending', async () => {
+      /* eslint-disable require-yield */
+      class ThrowingModel implements Model {
+        async getResponse(): Promise<ModelResponse> {
+          throw new Error('boom');
+        }
+
+        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
+          throw new Error('not used');
+        }
+      }
+      /* eslint-enable require-yield */
+
+      const markSpy = vi.spyOn(
+        ServerConversationTracker.prototype,
+        'markInputAsSent',
+      );
+      const agent = new Agent({
+        name: 'MarkFailure',
+        model: new ThrowingModel(),
+      });
+      const runner = new Runner();
+
+      await expect(
+        runner.run(agent, 'please fail', {
+          conversationId: 'conv-mark-failure',
+        }),
+      ).rejects.toThrow('boom');
+
+      expect(markSpy).not.toHaveBeenCalled();
+      markSpy.mockRestore();
+    });
+
+    it('skips persisting turns when the server manages conversation history via conversationId', async () => {
+      const model = new TrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('response')],
+        },
+      ]);
+      const agent = new Agent({ name: 'ServerManagedConversation', model });
+      // Deliberately combine session with conversationId to ensure callbacks and state helpers remain usable without duplicating remote history.
+      const session = new RecordingSession();
+      const runner = new Runner();
+
+      await runner.run(agent, 'Hello there', {
+        session,
+        conversationId: 'conv-server-managed',
+      });
+
+      expect(session.added).toHaveLength(0);
+      expect(model.lastRequest?.conversationId).toBe('conv-server-managed');
+    });
+
+    it('skips persisting turns when the server manages conversation history via previousResponseId', async () => {
+      const model = new TrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('response')],
+        },
+      ]);
+      const agent = new Agent({ name: 'ServerManagedPrevious', model });
+      // Deliberately combine session with previousResponseId to ensure we honor server-side transcripts while keeping session utilities available.
+      const session = new RecordingSession();
+      const runner = new Runner();
+
+      await runner.run(agent, 'Hi again', {
+        session,
+        previousResponseId: 'resp-existing',
+      });
+
+      expect(session.added).toHaveLength(0);
+      expect(model.lastRequest?.previousResponseId).toBe('resp-existing');
+    });
+
+    it('preserves user input when the session callback only reuses history with conversationId', async () => {
+      const model = new TrackingModel([
+        {
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('response')],
+        },
+      ]);
+      const agent = new Agent({ name: 'ServerManagedReuse', model });
+      const persistedHistory: AgentInputItem[] = [
+        assistant('Persisted reply from history'),
+      ];
+      const session: Session = {
+        async getSessionId() {
+          return 'server-managed-session';
+        },
+        async getItems() {
+          return persistedHistory;
+        },
+        async addItems(items) {
+          persistedHistory.push(...items);
+        },
+        async popItem() {
+          return persistedHistory.pop();
+        },
+        async clearSession() {
+          persistedHistory.length = 0;
+        },
+      };
+      const runner = new Runner();
+
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      await runner.run(agent, 'Latest user input', {
+        session,
+        conversationId: 'conv-history-only',
+        sessionInputCallback: (historyItems) => historyItems,
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        'sessionInputCallback dropped all new inputs in a server-managed conversation; original turn inputs were restored to avoid losing the API delta. Keep at least one new item or omit conversationId if you intended to drop them.',
+      );
+      warnSpy.mockRestore();
+
+      const firstInput = model.firstRequest?.input;
+      expect(Array.isArray(firstInput)).toBe(true);
+      const sentItems = firstInput as AgentInputItem[];
+      expect(sentItems).toHaveLength(1);
+      expect(getFirstTextContent(sentItems[0])).toBe('Latest user input');
+    });
+
+    it('only sends new items when using conversationId across turns', async () => {
+      const model = new TrackingModel([
+        buildResponse(
+          [fakeModelMessage('a_message'), buildToolCall('call-1', 'foo')],
+          'resp-1',
+        ),
+        buildResponse(
+          [fakeModelMessage('b_message'), buildToolCall('call-2', 'bar')],
+          'resp-2',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-3'),
+      ]);
+
+      const agent = new Agent({
+        name: 'Test',
+        model,
+        tools: [serverTool],
+      });
+
+      const runner = new Runner();
+      const result = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-test-123',
+      });
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests.map((req) => req.conversationId)).toEqual([
+        'conv-test-123',
+        'conv-test-123',
+        'conv-test-123',
+      ]);
+
+      const firstInput = model.requests[0].input;
+      expect(Array.isArray(firstInput)).toBe(true);
+      expect(firstInput as AgentInputItem[]).toHaveLength(1);
+      const userMessage = (firstInput as AgentInputItem[])[0] as any;
+      expect(userMessage.role).toBe('user');
+      expect(userMessage.content).toBe('user_message');
+
+      const secondInput = model.requests[1].input;
+      expect(Array.isArray(secondInput)).toBe(true);
+      const secondItems = secondInput as AgentInputItem[];
+      expect(secondItems).toHaveLength(1);
+      expect(secondItems[0]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-1',
+      });
+
+      const thirdInput = model.requests[2].input;
+      expect(Array.isArray(thirdInput)).toBe(true);
+      const thirdItems = thirdInput as AgentInputItem[];
+      expect(thirdItems).toHaveLength(1);
+      expect(thirdItems[0]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-2',
+      });
+    });
+
+    it('does not retry a failed server-managed request before the server ack is recorded', async () => {
+      class RetryTrackingModel extends TrackingModel {
+        attempts = 0;
+
+        override async getResponse(
+          request: ModelRequest,
+        ): Promise<ModelResponse> {
+          this.attempts += 1;
+          if (this.attempts === 1) {
+            this['recordRequest'](request);
+            const error = new Error('temporary conversation failure');
+            (error as Error & { statusCode?: number }).statusCode = 503;
+            throw error;
+          }
+          return await super.getResponse(request);
+        }
+      }
+
+      const markSpy = vi.spyOn(
+        ServerConversationTracker.prototype,
+        'markInputAsSent',
+      );
+      const model = new RetryTrackingModel([
+        buildResponse([buildToolCall('call-retry', 'foo')], 'resp-retry-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-retry-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'RetryConversationAgent',
+        model,
+        tools: [serverTool],
+        modelSettings: {
+          retry: {
+            maxRetries: 1,
+            backoff: { initialDelayMs: 0, jitter: false },
+            policy: ({ normalized }) => normalized.statusCode === 503,
+          },
+        },
+      });
+
+      await expect(
+        new Runner().run(agent, 'user_message', {
+          conversationId: 'conv-retry-managed',
+        }),
+      ).rejects.toThrow('temporary conversation failure');
+
+      expect(model.requests).toHaveLength(1);
+      expect(markSpy).not.toHaveBeenCalled();
+
+      const firstAttemptItems = model.requests[0].input as AgentInputItem[];
+      expect(firstAttemptItems).toHaveLength(1);
+      expect(getFirstTextContent(firstAttemptItems[0]!)).toBe('user_message');
+
+      markSpy.mockRestore();
+    });
+
+    it('only sends new items and updates previousResponseId across turns', async () => {
+      const model = new TrackingModel([
+        buildResponse(
+          [fakeModelMessage('a_message'), buildToolCall('call-1', 'foo')],
+          'resp-789',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-900'),
+      ]);
+
+      const agent = new Agent({
+        name: 'Test',
+        model,
+        tools: [serverTool],
+      });
+
+      const runner = new Runner();
+      const result = await runner.run(agent, 'user_message', {
+        previousResponseId: 'initial-response-123',
+      });
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      expect(model.requests[0].previousResponseId).toBe('initial-response-123');
+
+      const secondRequest = model.requests[1];
+      expect(secondRequest.previousResponseId).toBe('resp-789');
+      expect(Array.isArray(secondRequest.input)).toBe(true);
+      const secondItems = secondRequest.input as AgentInputItem[];
+      expect(secondItems).toHaveLength(1);
+      expect(secondItems[0]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-1',
+      });
+    });
+
+    it('acknowledges ignored handoffs when continuing a managed previousResponseId run', async () => {
+      const agentBModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done B')], 'resp-b'),
+      ]);
+      const agentCModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done C')], 'resp-c'),
+      ]);
+      const agentB = new Agent({
+        name: 'ManagedB',
+        model: agentBModel,
+      });
+      const agentC = new Agent({
+        name: 'ManagedC',
+        model: agentCModel,
+      });
+      const handoffToB = handoff(agentB);
+      const handoffToC = handoff(agentC);
+      const acceptedCall: protocol.FunctionCallItem = {
+        id: 'h1',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'c1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const ignoredCall: protocol.FunctionCallItem = {
+        id: 'h2',
+        type: 'function_call',
+        name: handoffToC.toolName,
+        callId: 'c2',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'ManagedA',
+        model: new TrackingModel([
+          buildResponse([acceptedCall, ignoredCall], 'resp-a'),
+        ]),
+        handoffs: [handoffToB, handoffToC],
+      });
+
+      const result = await new Runner().run(agentA, 'hi', {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(result.finalOutput).toBe('done B');
+      expect(agentBModel.requests).toHaveLength(1);
+      expect(agentCModel.requests).toHaveLength(0);
+      expect(agentBModel.requests[0].previousResponseId).toBe('resp-a');
+      expect(agentBModel.requests[0].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: acceptedCall.callId,
+        }),
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: ignoredCall.callId,
+        }),
+      ]);
+      expect(
+        result.history.some(
+          (item) => (item as { callId?: string }).callId === ignoredCall.callId,
+        ),
+      ).toBe(false);
+    });
+
+    it('acknowledges ignored handoffs even when callIds were reused in earlier turns', async () => {
+      const agentBModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done B')], 'resp-b'),
+      ]);
+      const agentCModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done C')], 'resp-c'),
+      ]);
+      const agentB = new Agent({
+        name: 'ManagedReuseB',
+        model: agentBModel,
+      });
+      const agentC = new Agent({
+        name: 'ManagedReuseC',
+        model: agentCModel,
+      });
+      const handoffToB = handoff(agentB);
+      const handoffToC = handoff(agentC);
+      const reusedCallId = 'reused-call-id';
+      const acceptedCall: protocol.FunctionCallItem = {
+        id: 'handoff-accepted',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'handoff-accepted-id',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const ignoredCall: protocol.FunctionCallItem = {
+        id: 'handoff-ignored',
+        type: 'function_call',
+        name: handoffToC.toolName,
+        callId: reusedCallId,
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'ManagedReuseA',
+        model: new TrackingModel([
+          buildResponse([buildToolCall(reusedCallId, 'warmup')], 'resp-tool'),
+          buildResponse([acceptedCall, ignoredCall], 'resp-handoff'),
+        ]),
+        tools: [serverTool],
+        handoffs: [handoffToB, handoffToC],
+      });
+
+      const result = await new Runner().run(agentA, 'hi', {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(result.finalOutput).toBe('done B');
+      expect(agentBModel.requests).toHaveLength(1);
+      expect(agentCModel.requests).toHaveLength(0);
+      expect(agentBModel.requests[0].previousResponseId).toBe('resp-handoff');
+      expect(agentBModel.requests[0].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: acceptedCall.callId,
+        }),
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: ignoredCall.callId,
+        }),
+      ]);
+    });
+
+    it('replays pending managed handoff acknowledgements when resuming in non-stream mode', async () => {
+      const agentBModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done B')], 'resp-b'),
+      ]);
+      const agentB = new Agent({
+        name: 'ManagedResumeNonStreamB',
+        model: agentBModel,
+      });
+      const agentC = new Agent({
+        name: 'ManagedResumeNonStreamC',
+        model: new TrackingModel([
+          buildResponse([fakeModelMessage('done C')], 'resp-c'),
+        ]),
+      });
+      const handoffToB = handoff(agentB);
+      const handoffToC = handoff(agentC);
+      const acceptedCall: protocol.FunctionCallItem = {
+        id: 'handoff-accepted',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'c1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const ignoredCall: protocol.FunctionCallItem = {
+        id: 'handoff-ignored',
+        type: 'function_call',
+        name: handoffToC.toolName,
+        callId: 'c2',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'ManagedResumeNonStreamA',
+        model: new TrackingModel([]),
+        handoffs: [handoffToB, handoffToC],
+      });
+      const state = new RunState(new RunContext(), 'hi', agentA, 3);
+
+      state._currentAgent = agentB;
+      state._currentTurn = 1;
+      state._currentTurnInProgress = true;
+      state._currentStep = { type: 'next_step_run_again' } as const;
+      state._noActiveAgentRun = true;
+      state._modelResponses = [
+        buildResponse([acceptedCall, ignoredCall], 'resp-a'),
+      ];
+      state._generatedItems = [
+        new RunHandoffOutputItem(
+          {
+            type: 'function_call_result',
+            name: acceptedCall.name,
+            callId: acceptedCall.callId,
+            status: 'completed',
+            output: {
+              type: 'text',
+              text: 'Transferred to ManagedResumeNonStreamB',
+            },
+          },
+          agentA,
+          agentB,
+        ),
+      ];
+      state._lastProcessedResponse = {
+        newItems: [],
+        handoffs: [
+          { toolCall: acceptedCall, handoff: handoffToB },
+          { toolCall: ignoredCall, handoff: handoffToC },
+        ],
+        functions: [],
+        computerActions: [],
+        shellActions: [],
+        applyPatchActions: [],
+        mcpApprovalRequests: [],
+        toolsUsed: [],
+        hasToolsOrApprovalsToRun: () => true,
+      } as any;
+      state.setConversationContext(
+        'conv-managed-handoff-resume-non-stream',
+        undefined,
+      );
+
+      const result = await new Runner().run(agentA, state, {
+        conversationId: 'conv-managed-handoff-resume-non-stream',
+      });
+
+      expect(result.finalOutput).toBe('done B');
+      expect(agentBModel.requests).toHaveLength(1);
+      expect(agentBModel.requests[0].conversationId).toBe(
+        'conv-managed-handoff-resume-non-stream',
+      );
+      expect(agentBModel.requests[0].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: acceptedCall.callId,
+        }),
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: ignoredCall.callId,
+        }),
+      ]);
+    });
+
+    it('does not append ignored handoff acknowledgements after removeAllTools filters the handoff input', async () => {
+      const agentBModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done B')], 'resp-b'),
+      ]);
+      const agentCModel = new TrackingModel([
+        buildResponse([fakeModelMessage('done C')], 'resp-c'),
+      ]);
+      const agentB = new Agent({
+        name: 'ManagedFilteredB',
+        model: agentBModel,
+      });
+      const agentC = new Agent({
+        name: 'ManagedFilteredC',
+        model: agentCModel,
+      });
+      const handoffToB = handoff(agentB, {
+        inputFilter: removeAllTools,
+      });
+      const handoffToC = handoff(agentC);
+      const acceptedCall: protocol.FunctionCallItem = {
+        id: 'handoff-filtered-accepted',
+        type: 'function_call',
+        name: handoffToB.toolName,
+        callId: 'filtered-c1',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const ignoredCall: protocol.FunctionCallItem = {
+        id: 'handoff-filtered-ignored',
+        type: 'function_call',
+        name: handoffToC.toolName,
+        callId: 'filtered-c2',
+        status: 'completed',
+        arguments: '{}',
+      };
+      const agentA = new Agent({
+        name: 'ManagedFilteredA',
+        model: new TrackingModel([
+          buildResponse([acceptedCall, ignoredCall], 'resp-a'),
+        ]),
+        handoffs: [handoffToB, handoffToC],
+      });
+
+      const result = await new Runner().run(agentA, 'hi', {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(result.finalOutput).toBe('done B');
+      expect(agentBModel.requests).toHaveLength(1);
+      expect(agentCModel.requests).toHaveLength(0);
+      expect(agentBModel.requests[0].previousResponseId).toBe('resp-a');
+      expect(agentBModel.requests[0].input).toEqual([]);
+    });
+
+    it('does not replay orphan hosted shell calls in default multi-turn runs', async () => {
+      const hostedShell = shellTool({
+        environment: { type: 'container_auto' },
+      });
+      const model = new TrackingModel([
+        buildResponse(
+          [
+            {
+              type: 'shell_call',
+              callId: 'call-shell-1',
+              status: 'completed',
+              action: { commands: ['echo hi'] },
+            } satisfies protocol.ShellCallItem,
+          ],
+          'resp-shell-1',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-shell-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'HostedShellAgent',
+        model,
+        tools: [hostedShell],
+      });
+
+      const result = await new Runner().run(agent, 'user_message');
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(secondInput).toHaveLength(1);
+      expect(secondInput[0]).toMatchObject({
+        type: 'message',
+        role: 'user',
+        content: 'user_message',
+      });
+      expect(secondInput.some((item) => item.type === 'shell_call')).toBe(
+        false,
+      );
+    });
+
+    it('does not reintroduce orphan hosted shell calls when continuing from public history', async () => {
+      const hostedShell = shellTool({
+        environment: { type: 'container_auto' },
+      });
+      const model = new TrackingModel([
+        buildResponse(
+          [
+            {
+              type: 'shell_call',
+              callId: 'call-shell-1',
+              status: 'completed',
+              action: { commands: ['echo hi'] },
+            } satisfies protocol.ShellCallItem,
+          ],
+          'resp-shell-1',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-shell-2'),
+        buildResponse(
+          [fakeModelMessage('continued from result')],
+          'resp-shell-3',
+        ),
+        buildResponse(
+          [fakeModelMessage('continued from state')],
+          'resp-shell-4',
+        ),
+      ]);
+
+      const agent = new Agent({
+        name: 'HostedShellAgent',
+        model,
+        tools: [hostedShell],
+      });
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message');
+
+      expect(
+        firstResult.history.some((item) => item.type === 'shell_call'),
+      ).toBe(false);
+      expect(
+        firstResult.state.history.some((item) => item.type === 'shell_call'),
+      ).toBe(false);
+
+      await runner.run(agent, firstResult.history);
+      await runner.run(agent, firstResult.state.history);
+
+      expect(model.requests).toHaveLength(4);
+      const continuedFromResult = getRequestInputItems(model.requests[2]);
+      const continuedFromState = getRequestInputItems(model.requests[3]);
+
+      expect(
+        continuedFromResult.some((item) => item.type === 'shell_call'),
+      ).toBe(false);
+      expect(
+        continuedFromState.some((item) => item.type === 'shell_call'),
+      ).toBe(false);
+      expect(continuedFromResult).toEqual(firstResult.history);
+      expect(continuedFromState).toEqual(firstResult.state.history);
+    });
+
+    it('replays pending hosted shell calls in default multi-turn runs', async () => {
+      const hostedShell = shellTool({
+        environment: { type: 'container_auto' },
+      });
+      const model = new TrackingModel([
+        buildResponse(
+          [
+            {
+              type: 'shell_call',
+              callId: 'call-shell-pending',
+              status: 'in_progress',
+              action: { commands: ['echo hi'] },
+            } satisfies protocol.ShellCallItem,
+          ],
+          'resp-shell-pending-1',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-shell-pending-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'HostedShellAgent',
+        model,
+        tools: [hostedShell],
+      });
+
+      const result = await new Runner().run(agent, 'user_message');
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(secondInput).toHaveLength(2);
+      expect(secondInput[0]).toMatchObject({
+        type: 'message',
+        role: 'user',
+        content: 'user_message',
+      });
+      expect(secondInput[1]).toMatchObject({
+        type: 'shell_call',
+        callId: 'call-shell-pending',
+        status: 'in_progress',
+      });
+    });
+
+    it('does not retry a failed previousResponseId request before the server ack is recorded', async () => {
+      class RetryTrackingModel extends TrackingModel {
+        attempts = 0;
+
+        override async getResponse(
+          request: ModelRequest,
+        ): Promise<ModelResponse> {
+          this.attempts += 1;
+          if (this.attempts === 1) {
+            this['recordRequest'](request);
+            const error = new Error('temporary previousResponseId failure');
+            (error as Error & { statusCode?: number }).statusCode = 503;
+            throw error;
+          }
+          return await super.getResponse(request);
+        }
+      }
+
+      const model = new RetryTrackingModel([
+        buildResponse(
+          [buildToolCall('call-prev-retry', 'foo')],
+          'resp-prev-retry-1',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-prev-retry-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'RetryPreviousResponseAgent',
+        model,
+        tools: [serverTool],
+        modelSettings: {
+          retry: {
+            maxRetries: 1,
+            backoff: { initialDelayMs: 0, jitter: false },
+            policy: ({ normalized }) => normalized.statusCode === 503,
+          },
+        },
+      });
+
+      await expect(
+        new Runner().run(agent, 'user_message', {
+          previousResponseId: 'initial-response-123',
+        }),
+      ).rejects.toThrow('temporary previousResponseId failure');
+
+      expect(model.requests).toHaveLength(1);
+      expect(model.requests[0].previousResponseId).toBe('initial-response-123');
+
+      const firstAttemptItems = model.requests[0].input as AgentInputItem[];
+      expect(firstAttemptItems).toHaveLength(1);
+      expect(getFirstTextContent(firstAttemptItems[0]!)).toBe('user_message');
+    });
+
+    it('does not retry a streamed server-managed request before the server ack is recorded', async () => {
+      /* eslint-disable require-yield */
+      class RetryStreamingTrackingModel implements Model {
+        public requests: ModelRequest[] = [];
+        attempts = 0;
+
+        async getResponse(): Promise<ModelResponse> {
+          throw new Error('not used');
+        }
+
+        async *getStreamedResponse(
+          request: ModelRequest,
+        ): AsyncIterable<protocol.StreamEvent> {
+          this.requests.push({
+            ...request,
+            input:
+              typeof request.input === 'string'
+                ? request.input
+                : (JSON.parse(
+                    JSON.stringify(request.input),
+                  ) as AgentInputItem[]),
+          });
+          this.attempts += 1;
+          const error = new Error('temporary streamed conversation failure');
+          (error as Error & { statusCode?: number }).statusCode = 503;
+          throw error;
+        }
+      }
+      /* eslint-enable require-yield */
+
+      const model = new RetryStreamingTrackingModel();
+      const markSpy = vi.spyOn(
+        ServerConversationTracker.prototype,
+        'markInputAsSent',
+      );
+      const agent = new Agent({
+        name: 'RetryStreamingConversationAgent',
+        model,
+        modelSettings: {
+          retry: {
+            maxRetries: 1,
+            backoff: { initialDelayMs: 0, jitter: false },
+            policy: ({ normalized }) => normalized.statusCode === 503,
+          },
+        },
+      });
+
+      const result = await new Runner().run(agent, 'user_message', {
+        stream: true,
+        conversationId: 'conv-stream-retry-managed',
+      });
+
+      const consume = async () => {
+        for await (const _event of result) {
+          // Consume until the stream throws.
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(
+        'temporary streamed conversation failure',
+      );
+      expect(model.attempts).toBe(1);
+      expect(model.requests).toHaveLength(1);
+      expect(markSpy).not.toHaveBeenCalled();
+      markSpy.mockRestore();
+    });
+
+    it('does not resend prior items when resuming with conversationId', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'tool that requires approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      const model = new TrackingModel([
+        buildResponse([buildToolCall('call-approved', 'foo')], 'resp-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'ApprovalAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-approval',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      const approvalItem = firstResult.interruptions[0];
+      firstResult.state.approve(approvalItem);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-approval',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const firstInput = model.requests[0].input;
+      expect(Array.isArray(firstInput)).toBe(true);
+      const firstItems = firstInput as AgentInputItem[];
+      expect(firstItems).toHaveLength(1);
+      expect(firstItems[0]).toMatchObject({
+        role: 'user',
+        content: 'user_message',
+      });
+
+      const secondRequest = model.requests[1];
+      expect(secondRequest.conversationId).toBe('conv-approval');
+      expect(Array.isArray(secondRequest.input)).toBe(true);
+      const secondItems = secondRequest.input as AgentInputItem[];
+      expect(secondItems).toHaveLength(1);
+      expect(secondItems[0]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-approved',
+      });
+    });
+
+    it('does not resend prior items when resuming with previousResponseId', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'tool that requires approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      const model = new TrackingModel([
+        buildResponse([buildToolCall('call-prev', 'foo')], 'resp-prev-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-prev-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'ApprovalPrevAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      const approvalItem = firstResult.interruptions[0];
+      firstResult.state.approve(approvalItem);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      expect(model.requests[0].previousResponseId).toBe('initial-response');
+
+      const secondRequest = model.requests[1];
+      expect(secondRequest.previousResponseId).toBe('resp-prev-1');
+      expect(Array.isArray(secondRequest.input)).toBe(true);
+      const secondItems = secondRequest.input as AgentInputItem[];
+      expect(secondItems).toHaveLength(1);
+      expect(secondItems[0]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-prev',
+      });
+    });
+
+    it('does not resend items when resuming multiple times without new approvals', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'approval tool',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      const model = new TrackingModel([
+        buildResponse([buildToolCall('call-repeat', 'foo')], 'resp-repeat-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-repeat-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'RepeatAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-repeat',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      const approvalItem = firstResult.interruptions[0];
+      firstResult.state.approve(approvalItem);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-repeat',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+
+      const thirdResult = await runner.run(agent, secondResult.state, {
+        conversationId: 'conv-repeat',
+      });
+
+      expect(thirdResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+    });
+
+    it('sends newly appended generated items when resuming', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'approval tool',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      const model = new TrackingModel([
+        buildResponse([buildToolCall('call-extra', 'foo')], 'resp-extra-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-extra-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'ExtraAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-extra',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      const approvalItem = firstResult.interruptions[0];
+
+      const extraMessage = new MessageOutputItem(
+        fakeModelMessage('cached note'),
+        agent,
+      );
+      firstResult.state._generatedItems.push(extraMessage);
+
+      firstResult.state.approve(approvalItem);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-extra',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondItems = model.requests[1].input as AgentInputItem[];
+      expect(secondItems).toHaveLength(2);
+      expect(secondItems[0]).toMatchObject({
+        type: 'message',
+        content: expect.arrayContaining([
+          expect.objectContaining({ text: 'cached note' }),
+        ]),
+      });
+      expect(secondItems[1]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-extra',
+      });
+    });
+
+    it('sends only approved items when mixing function and MCP approvals', async () => {
+      const functionTool = tool({
+        name: 'test',
+        description: 'function tool',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+
+      const mcpTool = hostedMcpTool({
+        serverLabel: 'demo_server',
+        serverUrl: 'https://example.com',
+        requireApproval: {
+          always: { toolNames: ['demo_tool'] },
+        },
+      });
+
+      const mcpApprovalCall: protocol.HostedToolCallItem = {
+        type: 'hosted_tool_call',
+        id: 'approval-id',
+        name: 'mcp_approval_request',
+        status: 'completed',
+        providerData: {
+          type: 'mcp_approval_request',
+          server_label: 'demo_server',
+          name: 'demo_tool',
+          id: 'approval-id',
+          arguments: '{}',
+        },
+      } as protocol.HostedToolCallItem;
+
+      const model = new TrackingModel([
+        buildResponse(
+          [mcpApprovalCall, buildToolCall('call-mixed', 'foo')],
+          'resp-mixed-1',
+        ),
+        buildResponse([fakeModelMessage('still waiting')], 'resp-mixed-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'MixedAgent',
+        model,
+        tools: [functionTool, mcpTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-mixed',
+      });
+
+      const functionApproval = firstResult.interruptions.find(
+        (item) => item.rawItem.type === 'function_call',
+      );
+      const mcpApproval = firstResult.interruptions.find(
+        (item) => item.rawItem.type === 'hosted_tool_call',
+      );
+
+      expect(functionApproval).toBeDefined();
+      expect(mcpApproval).toBeDefined();
+
+      firstResult.state.approve(functionApproval!);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-mixed',
+      });
+
+      expect(model.requests).toHaveLength(1);
+
+      const toolOutputs = secondResult.newItems.filter(
+        (item) =>
+          item instanceof ToolCallOutputItem &&
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.callId === 'call-mixed',
+      );
+      expect(toolOutputs).toHaveLength(1);
+
+      expect(secondResult.interruptions).toHaveLength(1);
+      expect(secondResult.interruptions[0].rawItem).toMatchObject({
+        providerData: { id: 'approval-id', type: 'mcp_approval_request' },
+      });
+      expect(secondResult.state._currentStep?.type).toBe(
+        'next_step_interruption',
+      );
+    });
+
+    it('does not use toolErrorFormatter for hosted MCP rejection responses', async () => {
+      const mcpTool = hostedMcpTool({
+        serverLabel: 'demo_server',
+        serverUrl: 'https://example.com',
+        requireApproval: {
+          always: { toolNames: ['demo_tool'] },
+        },
+      });
+
+      const mcpApprovalCall: protocol.HostedToolCallItem = {
+        type: 'hosted_tool_call',
+        id: 'approval-id',
+        name: 'mcp_approval_request',
+        status: 'completed',
+        providerData: {
+          type: 'mcp_approval_request',
+          server_label: 'demo_server',
+          name: 'demo_tool',
+          id: 'approval-id',
+          arguments: '{}',
+        },
+      } as protocol.HostedToolCallItem;
+
+      const model = new TrackingModel([
+        buildResponse([mcpApprovalCall], 'resp-mcp-reject-1'),
+        buildResponse([fakeModelMessage('done')], 'resp-mcp-reject-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'HostedMcpRejectAgent',
+        model,
+        tools: [mcpTool],
+      });
+
+      const formatter = vi.fn(() => 'Formatter denial');
+      const runner = new Runner({
+        toolErrorFormatter: formatter,
+      });
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-mcp-reject',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      firstResult.state.reject(firstResult.interruptions[0]);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-mcp-reject',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+      expect(formatter).not.toHaveBeenCalled();
+      expect(model.requests).toHaveLength(2);
+
+      const secondRequest = model.requests[1];
+      expect(secondRequest.conversationId).toBe('conv-mcp-reject');
+      expect(Array.isArray(secondRequest.input)).toBe(true);
+      const secondItems = secondRequest.input as AgentInputItem[];
+      expect(secondItems).toHaveLength(1);
+      expect(secondItems[0]).toMatchObject({
+        type: 'hosted_tool_call',
+        name: 'mcp_approval_response',
+        providerData: {
+          approve: false,
+          approval_request_id: 'approval-id',
+        },
+      });
+      expect(
+        (
+          secondItems[0] as protocol.HostedToolCallItem & {
+            providerData: { reason?: string };
+          }
+        ).providerData.reason,
+      ).toBeUndefined();
+    });
+
+    it('sends full history when no server-managed state is provided', async () => {
+      const model = new TrackingModel([
+        buildResponse(
+          [fakeModelMessage('a_message'), buildToolCall('call-1', 'foo')],
+          'resp-789',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-900'),
+      ]);
+
+      const agent = new Agent({
+        name: 'Test',
+        model,
+        tools: [serverTool],
+      });
+
+      const runner = new Runner();
+      const result = await runner.run(agent, 'user_message');
+
+      expect(result.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const secondInput = model.requests[1].input;
+      expect(Array.isArray(secondInput)).toBe(true);
+      const secondItems = secondInput as AgentInputItem[];
+      expect(secondItems).toHaveLength(4);
+      expect(secondItems[0]).toMatchObject({ role: 'user' });
+      expect(secondItems[1]).toMatchObject({ role: 'assistant' });
+      expect(secondItems[2]).toMatchObject({
+        type: 'function_call',
+        name: 'test',
+      });
+      expect(secondItems[3]).toMatchObject({
+        type: 'function_call_result',
+        callId: 'call-1',
+      });
+    });
+  });
+
+  describe('selectModel', () => {
+    const MODEL_A = 'gpt-4o';
+    const MODEL_B = 'gpt-4.1-mini';
+
+    it("returns the agent's model when it is a non-empty string and no override is provided", () => {
+      const result = selectModel(MODEL_A, undefined);
+      expect(result).toBe(MODEL_A);
+    });
+
+    it("returns the agent's model when it is a non-empty string even when an override is provided", () => {
+      const result = selectModel(MODEL_A, MODEL_B);
+      expect(result).toBe(MODEL_A);
+    });
+
+    it("returns the agent's model when it is a Model instance and no override is provided", () => {
+      const fakeModel = new FakeModel();
+      const result = selectModel(fakeModel, undefined);
+      expect(result).toBe(fakeModel);
+    });
+
+    it("returns the agent's model when it is a Model instance even when an override is provided", () => {
+      const fakeModel = new FakeModel();
+      const result = selectModel(fakeModel, MODEL_B);
+      expect(result).toBe(fakeModel);
+    });
+
+    it('returns the override model when the agent model is the default placeholder', () => {
+      const result = selectModel(Agent.DEFAULT_MODEL_PLACEHOLDER, MODEL_B);
+      expect(result).toBe(MODEL_B);
+    });
+
+    it('returns the default placeholder when both agent and override models are the default placeholder / undefined', () => {
+      const result = selectModel(Agent.DEFAULT_MODEL_PLACEHOLDER, undefined);
+      expect(result).toBe(Agent.DEFAULT_MODEL_PLACEHOLDER);
+    });
+  });
+});
