@@ -1,0 +1,604 @@
+import { describe, it, expect, vi } from 'vitest';
+import { UserError } from '@openai/agents-core';
+import { convertChatCompletionsStreamToResponses } from '../src/openaiChatCompletionsStreaming';
+import { FAKE_ID } from '../src/openaiChatCompletionsModel';
+import logger from '../src/logger';
+import type {
+  ChatCompletion,
+  ChatCompletionChunk,
+} from 'openai/resources/chat';
+
+function makeChunk(delta: any, usage?: any) {
+  return {
+    id: 'c',
+    created: 0,
+    model: 'm',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta }],
+    usage,
+  } as any;
+}
+
+describe('convertChatCompletionsStreamToResponses', () => {
+  it('emits protocol events for streamed chat completions', async () => {
+    const response: ChatCompletion = {
+      id: 'res1',
+      created: 0,
+      model: 'gpt-test',
+      object: 'chat.completion',
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+
+    const chunk1: ChatCompletionChunk = {
+      id: 'res1',
+      created: 1,
+      model: 'gpt-test',
+      object: 'chat.completion.chunk',
+      choices: [
+        {
+          index: 0,
+          delta: { content: 'hello' },
+        },
+      ],
+    } as any;
+
+    const chunk2: ChatCompletionChunk = {
+      id: 'res1',
+      created: 2,
+      model: 'gpt-test',
+      object: 'chat.completion.chunk',
+      choices: [
+        {
+          index: 0,
+          delta: { refusal: 'nope' },
+        },
+      ],
+    } as any;
+
+    const chunk3: ChatCompletionChunk = {
+      id: 'res1',
+      created: 3,
+      model: 'gpt-test',
+      object: 'chat.completion.chunk',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: 'call1',
+                function: { name: 'fn', arguments: '{}' },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+    } as any;
+
+    async function* fakeStream() {
+      yield chunk1;
+      yield chunk2;
+      yield chunk3;
+    }
+
+    const events = [] as any[];
+    for await (const ev of convertChatCompletionsStreamToResponses(
+      response,
+      fakeStream() as any,
+    )) {
+      events.push(ev);
+    }
+
+    expect(events[0]).toEqual({
+      type: 'response_started',
+      providerData: { ...chunk1 },
+    });
+    expect(events[1]).toEqual({
+      type: 'model',
+      event: chunk1,
+      providerData: { rawModelEventSource: 'openai-chat-completions' },
+    });
+    expect(events[2]).toEqual({
+      type: 'output_text_delta',
+      delta: 'hello',
+      providerData: { ...chunk1 },
+    });
+    expect(events[3]).toEqual({
+      type: 'model',
+      event: chunk2,
+      providerData: { rawModelEventSource: 'openai-chat-completions' },
+    });
+    expect(events[4]).toEqual({
+      type: 'model',
+      event: chunk3,
+      providerData: { rawModelEventSource: 'openai-chat-completions' },
+    });
+
+    expect(events[5]).toEqual({
+      type: 'response_done',
+      response: {
+        id: 'res1',
+        usage: {
+          inputTokens: 3,
+          outputTokens: 4,
+          totalTokens: 7,
+          inputTokensDetails: { cached_tokens: 0 },
+          outputTokensDetails: { reasoning_tokens: 0 },
+        },
+        output: [
+          {
+            id: 'res1',
+            role: 'assistant',
+            type: 'message',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'hello',
+                providerData: { annotations: [] },
+              },
+              { type: 'refusal', refusal: 'nope' },
+            ],
+          },
+          {
+            id: 'res1',
+            type: 'function_call',
+            arguments: '{}',
+            name: 'fn',
+            callId: 'call1',
+          },
+        ],
+      },
+    });
+
+    expect(response.choices).toEqual([
+      {
+        index: 0,
+        finish_reason: 'tool_calls',
+        logprobs: null,
+        message: {
+          role: 'assistant',
+          content: 'hello',
+          refusal: 'nope',
+          tool_calls: [
+            {
+              id: 'call1',
+              type: 'function',
+              function: { name: 'fn', arguments: '{}' },
+            },
+          ],
+        },
+      },
+    ]);
+    expect(response.usage).toMatchObject({
+      prompt_tokens: 3,
+      completion_tokens: 4,
+      total_tokens: 7,
+    });
+  });
+});
+
+describe('convertChatCompletionsStreamToResponses', () => {
+  it('converts chunks to protocol events', async () => {
+    async function* stream(): AsyncGenerator<
+      ChatCompletionChunk,
+      void,
+      unknown
+    > {
+      yield makeChunk({ content: 'he' });
+      yield makeChunk(
+        { content: 'llo' },
+        { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      );
+      yield makeChunk({
+        tool_calls: [
+          { index: 0, id: 'call', function: { name: 'fn', arguments: 'a' } },
+        ],
+      });
+    }
+
+    const resp = { id: 'r' } as any;
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    expect(events[0]).toEqual({
+      type: 'response_started',
+      providerData: makeChunk({ content: 'he' }),
+    });
+    // last event should be final response
+    const final = events[events.length - 1];
+    expect(final.type).toBe('response_done');
+    expect(final.response.output).toEqual([
+      {
+        id: 'r',
+        content: [
+          {
+            text: 'hello',
+            type: 'output_text',
+            providerData: { annotations: [] },
+          },
+        ],
+        role: 'assistant',
+        type: 'message',
+        status: 'completed',
+      },
+      {
+        id: 'r',
+        type: 'function_call',
+        name: 'fn',
+        callId: 'call',
+        arguments: 'a',
+      },
+    ]);
+    expect(final.response.usage.totalTokens).toBe(0);
+  });
+
+  it('ignores chunks with empty choices', async () => {
+    const emptyChunk: ChatCompletionChunk = {
+      id: 'e',
+      created: 0,
+      model: 'm',
+      object: 'chat.completion.chunk',
+      choices: [],
+    } as any;
+
+    async function* stream(): AsyncGenerator<
+      ChatCompletionChunk,
+      void,
+      unknown
+    > {
+      yield emptyChunk;
+      yield makeChunk({ content: 'hi' });
+    }
+
+    const resp = { id: 'r' } as any;
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const deltas = events.filter((ev) => ev.type === 'output_text_delta');
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0].delta).toBe('hi');
+  });
+
+  it('filters multiple choices by default', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const chunks: ChatCompletionChunk[] = [
+      {
+        id: 'c',
+        created: 0,
+        model: 'm',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 1, delta: { content: 'ignored-first' } }],
+      } as any,
+      {
+        id: 'c',
+        created: 0,
+        model: 'm',
+        object: 'chat.completion.chunk',
+        choices: [
+          { index: 0, delta: { content: 'kept' } },
+          { index: 1, delta: { content: 'ignored-second' } },
+        ],
+      } as any,
+      {
+        id: 'c',
+        created: 0,
+        model: 'm',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 2, delta: { content: 'ignored-third' } }],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      } as any,
+    ];
+
+    async function* stream() {
+      for (const chunk of chunks) {
+        yield chunk;
+      }
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      { id: 'r' } as any,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    expect(
+      events
+        .filter((event) => event.type === 'output_text_delta')
+        .map((event) => event.delta),
+    ).toEqual(['kept']);
+    const final = events.at(-1);
+    expect(final.response.output[0].content[0].text).toBe('kept');
+    expect(final.response.usage.totalTokens).toBe(3);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain(
+      'multiple choices or nonzero choice indexes',
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('rejects multiple choices in strict mode', async () => {
+    async function* stream() {
+      yield {
+        id: 'c',
+        created: 0,
+        model: 'm',
+        object: 'chat.completion.chunk',
+        choices: [
+          { index: 0, delta: { content: 'first' } },
+          { index: 1, delta: { content: 'second' } },
+        ],
+      } as any;
+    }
+
+    await expect(async () => {
+      for await (const _event of convertChatCompletionsStreamToResponses(
+        { id: 'r' } as any,
+        stream() as any,
+        { strictFeatureValidation: true },
+      )) {
+        // Consume the stream.
+      }
+    }).rejects.toThrow(UserError);
+  });
+
+  it('accumulates reasoning deltas into a reasoning item', async () => {
+    const resp: ChatCompletion = {
+      id: 'r1',
+      created: 0,
+      model: 'gpt-test',
+      object: 'chat.completion',
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+
+    async function* stream() {
+      yield makeChunk({ reasoning: 'foo' });
+      yield makeChunk({ reasoning: 'bar' });
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const final = events[events.length - 1];
+    expect(final.type).toBe('response_done');
+    expect(final.response.output[0]).toEqual({
+      type: 'reasoning',
+      content: [],
+      rawContent: [{ type: 'reasoning_text', text: 'foobar' }],
+    });
+  });
+
+  it('strips leading {} from tool call arguments when followed by real args', async () => {
+    const resp = { id: 'r' } as any;
+
+    async function* stream() {
+      yield makeChunk({
+        tool_calls: [
+          { index: 0, id: 'call1', function: { name: 'fn', arguments: '{}' } },
+        ],
+      });
+      yield makeChunk({
+        tool_calls: [{ index: 0, function: { arguments: '{"key":"value"}' } }],
+      });
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const final = events[events.length - 1];
+    const functionCall = final.response.output.find(
+      (o: any) => o.type === 'function_call',
+    );
+    expect(functionCall.arguments).toBe('{"key":"value"}');
+  });
+
+  it('preserves {} for legitimate empty tool call arguments', async () => {
+    const resp = { id: 'r' } as any;
+
+    async function* stream() {
+      yield makeChunk({
+        tool_calls: [
+          { index: 0, id: 'call1', function: { name: 'fn', arguments: '{}' } },
+        ],
+      });
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const final = events[events.length - 1];
+    const functionCall = final.response.output.find(
+      (o: any) => o.type === 'function_call',
+    );
+    expect(functionCall.arguments).toBe('{}');
+  });
+
+  it('aggregates multiple function calls into a single trace choice', async () => {
+    const resp: ChatCompletion = {
+      id: 'r-multi',
+      created: 0,
+      model: 'gpt-test',
+      object: 'chat.completion',
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+
+    async function* stream() {
+      yield makeChunk({
+        tool_calls: [
+          {
+            index: 0,
+            id: 'call1',
+            function: { name: 'lookup', arguments: '{"city":' },
+          },
+          {
+            index: 1,
+            id: 'call2',
+            function: { name: 'timezone', arguments: '{"zone":"JST"}' },
+          },
+        ],
+      });
+      yield {
+        ...makeChunk({
+          tool_calls: [{ index: 0, function: { arguments: '"Tokyo"}' } }],
+        }),
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: '"Tokyo"}' } }],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      } as any;
+    }
+
+    for await (const _event of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      // Drain all events.
+    }
+
+    expect(resp.choices).toEqual([
+      {
+        index: 0,
+        finish_reason: 'tool_calls',
+        logprobs: null,
+        message: {
+          role: 'assistant',
+          content: null,
+          refusal: null,
+          tool_calls: [
+            {
+              id: 'call1',
+              type: 'function',
+              function: { name: 'lookup', arguments: '{"city":"Tokyo"}' },
+            },
+            {
+              id: 'call2',
+              type: 'function',
+              function: { name: 'timezone', arguments: '{"zone":"JST"}' },
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it('ignores streamed custom tool calls by default', async () => {
+    async function* stream() {
+      yield makeChunk({
+        tool_calls: [{ index: 0, id: 'call1', type: 'custom' }],
+      });
+      yield makeChunk({
+        tool_calls: [
+          { index: 0, function: { name: 'ignored', arguments: 'x' } },
+        ],
+      });
+      yield makeChunk({ content: 'done' });
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      { id: 'r' } as any,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const final = events.at(-1);
+    expect(final.response.output).toHaveLength(1);
+    expect(final.response.output[0]).toMatchObject({
+      type: 'message',
+      content: [{ type: 'output_text', text: 'done' }],
+    });
+    expect(
+      final.response.output.some((item: any) => item.type === 'function_call'),
+    ).toBe(false);
+  });
+
+  it('rejects streamed custom tool calls in strict mode', async () => {
+    async function* stream() {
+      yield makeChunk({
+        tool_calls: [{ index: 0, id: 'call1', type: 'custom' }],
+      });
+    }
+
+    await expect(async () => {
+      for await (const _event of convertChatCompletionsStreamToResponses(
+        { id: 'r' } as any,
+        stream() as any,
+        { strictFeatureValidation: true },
+      )) {
+        // Consume the stream.
+      }
+    }).rejects.toThrow('Custom tool calls are not supported');
+  });
+
+  it('falls back to FAKE_ID when streaming chunks do not include an id', async () => {
+    const resp: ChatCompletion = {
+      id: FAKE_ID,
+      created: 0,
+      model: 'gpt-test',
+      object: 'chat.completion',
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+
+    async function* stream() {
+      yield {
+        ...makeChunk({ content: 'hello' }),
+        id: undefined,
+      } as any;
+    }
+
+    const events: any[] = [];
+    for await (const e of convertChatCompletionsStreamToResponses(
+      resp,
+      stream() as any,
+    )) {
+      events.push(e);
+    }
+
+    const final = events[events.length - 1];
+    expect(final.type).toBe('response_done');
+    expect(final.response.id).toBe(FAKE_ID);
+    expect(final.response.output[0]).toMatchObject({
+      id: FAKE_ID,
+      type: 'message',
+    });
+  });
+});

@@ -1,0 +1,139 @@
+---
+title: クイックスタート
+description: Build your first realtime voice assistant using the OpenAI Agents SDK in minutes.
+---
+
+import { Steps, Aside, Code } from '@astrojs/starlight/components';
+import helloWorldExample from '../../../../../../../examples/docs/voice-agents/helloWorld.ts?raw';
+
+<Aside type="note">
+  このクイックスタートでは、ほとんどのアプリで推奨されるデフォルトである
+  `@openai/agents` を使用します。スタンドアロンの Realtime
+  パッケージを使いたい場合は、 `@openai/agents-realtime`
+  をインストールし、以下の例にある `@openai/agents/realtime` からのインポートを
+  `@openai/agents-realtime` に置き換えてください。
+</Aside>
+
+## プロジェクトのセットアップと認証情報
+
+<Steps>
+
+1. **プロジェクトの作成**
+
+   このクイックスタートでは、ブラウザーで使用できる音声エージェントを作成します。新しいプロジェクトを scaffold したい場合は、[`Next.js`](https://nextjs.org/docs/getting-started/installation) または [`Vite`](https://vite.dev/guide/installation.html) から始められます。
+
+   ```bash
+   npm create vite@latest my-project -- --template vanilla-ts
+   ```
+
+2. **推奨パッケージのインストール** （Zod v4 が必要）
+
+   ```bash
+   npm install @openai/agents zod
+   ```
+
+3. **クライアント用エフェメラルトークンの生成**
+
+   このアプリケーションはユーザーのブラウザーで実行されるため、Realtime API を通じてモデルに接続する安全な方法が必要です。推奨フローは、公式の [WebRTC を使った Realtime API](https://developers.openai.com/api/docs/guides/realtime-webrtc/) ガイドと同じです。バックエンドが短命なエフェメラルクライアントトークンを作成し、ブラウザーがそのトークンを使って WebRTC 接続を確立します。テスト目的では、`curl` と通常の OpenAI API キーを使ってトークンを生成することもできます。
+
+   ```bash
+   export OPENAI_API_KEY="sk-proj-...(your own key here)"
+   curl -X POST https://api.openai.com/v1/realtime/client_secrets \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "session": {
+          "type": "realtime",
+          "model": "gpt-realtime-2"
+        }
+      }'
+   ```
+
+   レスポンスには、`ek_` プレフィックスで始まるトップレベルの `value` フィールドと、有効な `session` オブジェクトが含まれます。WebRTC 接続を確立する際は、`value` をクライアントシークレットとして使用してください。このトークンは短命なので、バックエンドは必要に応じて新しいものを発行する必要があります。ブラウザーセッションで `authorization` またはカスタム `headers` を持つ Hosted MCP ツールが必要な場合は、それらの認証情報をブラウザーコードに公開するのではなく、`POST /v1/realtime/client_secrets` に送信するサーバー側の `session` ペイロードに、その Hosted MCP 設定を含めてください。
+
+</Steps>
+
+<Aside type="note">
+  本番環境のブラウザーフロー:
+  ブラウザーがバックエンドに新しいエフェメラルトークンを要求し、
+  バックエンドがサーバー API キーを使って `POST /v1/realtime/client_secrets`
+  を呼び出し、 ブラウザーが返された `ek_...` トークンを `session.connect(...)`
+  に渡します。
+</Aside>
+
+## 音声エージェントの作成と接続
+
+<Steps>
+
+1. **最初の Agent の作成**
+
+   新しい [`RealtimeAgent`](/openai-agents-js/openai/agents-realtime/classes/realtimeagent/) の作成は、通常の [`Agent`](/openai-agents-js/ja/guides/agents) の作成と非常によく似ています。
+
+   ```typescript
+   import { RealtimeAgent } from '@openai/agents/realtime';
+
+   const agent = new RealtimeAgent({
+     name: 'Assistant',
+     instructions: 'You are a helpful assistant.',
+   });
+   ```
+
+2. **セッションの作成**
+
+   通常のエージェントとは異なり、音声エージェントは `RealtimeSession` 内で継続的に実行され、時間の経過に伴う会話とモデルへの接続を処理します。このセッションは、後で設定する音声処理、割り込み、より広い会話ライフサイクルも管理します。
+
+   ```typescript
+   import { RealtimeSession } from '@openai/agents/realtime';
+
+   const session = new RealtimeSession(agent, {
+     model: 'gpt-realtime-2',
+   });
+   ```
+
+   `RealtimeSession` コンストラクターは、最初の引数として `agent` を受け取ります。このエージェントが、ユーザーが最初に対話する相手になります。
+
+3. **セッションへの接続**
+
+   セッションに接続するには、先ほど生成したクライアント用エフェメラルトークンを渡す必要があります。
+
+   ```typescript
+   await session.connect({ apiKey: 'ek_...(put your own key here)' });
+   ```
+
+   ブラウザーでは、これにより WebRTC を使って Realtime API に接続し、マイク入力と音声再生が自動的に設定されます。そのデフォルトの WebRTC パスでは、データチャネルが開くとすぐに SDK が初期セッション設定を送信し、`connect()` が解決される前に対応する `session.updated` の確認応答を待とうとします。確認応答が届かない場合に備えて、タイムアウトのフォールバックもあります。Node.js などのサーバーランタイムで `RealtimeSession` を実行する場合、SDK は代わりに自動的に WebSocket にフォールバックします。WebSocket パスでは、ソケットが開き、初期設定が送信された後に `connect()` が解決されるため、`session.updated` は少し遅れて届く場合があります。トランスポートの選択について詳しくは、[リアルタイムトランスポート](/openai-agents-js/ja/guides/voice-agents/transport)ガイドをご覧ください。
+
+</Steps>
+
+<Aside type="note">
+  ピア接続や元のトランスポートイベントをより低レベルで制御したい場合は、
+  [`examples/realtime-next` の `/raw-client`
+  の例](https://github.com/openai/openai-agents-js/tree/main/examples/realtime-next)
+  を参照してください。
+</Aside>
+
+## アプリの実行とテスト
+
+<Steps>
+
+1. **全体のまとめ**
+
+   <Code lang="typescript" code={helloWorldExample} />
+
+2. **アプリの起動と会話の開始**
+
+   Web サーバーを起動し、新しい Realtime Agent コードを含むページを開きます。マイクの権限リクエストが表示されるはずです。アクセスを許可すると、エージェントと会話を始められます。
+
+   ```bash
+   npm run dev
+   ```
+
+</Steps>
+
+## 次のステップ
+
+ここから、独自の音声エージェントの設計と構築を始められます。
+
+- [ツール](/openai-agents-js/ja/guides/voice-agents/build#tools)、[ハンドオフ](/openai-agents-js/ja/guides/voice-agents/build#handoffs)、[ガードレール](/openai-agents-js/ja/guides/voice-agents/build#guardrails)を追加します。
+- [ターン検出と音声アクティビティ検出](/openai-agents-js/ja/guides/voice-agents/build#turn-detection-and-voice-activity-detection)、[割り込み](/openai-agents-js/ja/guides/voice-agents/build#interruptions)、[手動のレスポンス制御](/openai-agents-js/ja/guides/voice-agents/build#manual-response-control)が会話ループにどのように影響するかを学びます。
+- [テキスト入力](/openai-agents-js/ja/guides/voice-agents/build#text-input)、[画像入力](/openai-agents-js/ja/guides/voice-agents/build#image-input)、[セッション履歴管理](/openai-agents-js/ja/guides/voice-agents/build#conversation-history-management)を追加します。
+- デプロイに適したトランスポートを選択します: [WebRTC](/openai-agents-js/ja/guides/voice-agents/transport#webrtc-is-the-default-browser-choice)、[WebSocket](/openai-agents-js/ja/guides/voice-agents/transport#websocket-is-the-default-server-choice)、または[カスタムトランスポート](/openai-agents-js/ja/guides/voice-agents/transport#bring-your-own-transport)。
