@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://git.nmnm.cc/devenv.sh/devenv.schema.json
+inputs:
+  devenv:
+    url: git+https://git.nmnm.cc/github.com/cachix/devenv.git?shallow=1
+    inputs:
+      nixd:
+        follows: nixpkgs
+  nixpkgs:
+    url: git+https://git.nmnm.cc/github.com/cachix/devenv-nixpkgs.git?ref=rolling&shallow=1

@@ -5,9 +5,11 @@
     "@openai/agents": "^0.11.4",
     "@openai/agents-extensions": "^0.11.4",
     "effect": "^4.0.0-beta.66",
+    "git-diff": "^2.0.6",
     "zod": "4"
   },
   "devDependencies": {
-    "@effect/language-service": "^0.86.1"
+    "@effect/language-service": "^0.86.1",
+    "@types/git-diff": "^2"
   }
 }

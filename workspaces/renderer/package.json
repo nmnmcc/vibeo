@@ -1,0 +1,24 @@
+{
+  "name": "renderer",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "drizzle-kit": "1.0.0-rc.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@effect/platform-node": "^4.0.0-beta.67",
+    "@effect/sql-pg": "^4.0.0-beta.67",
+    "@kubernetes/client-node": "^1.4.0",
+    "drizzle-orm": "1.0.0-rc.2",
+    "effect": "^4.0.0-beta.67",
+    "s3mini": "^0.9.4",
+    "srvx": "^0.11.15",
+    "uuid": "^14.0.0"
+  }
+}

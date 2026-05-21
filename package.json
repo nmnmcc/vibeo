@@ -7,5 +7,11 @@
   ],
   "devDependencies": {
     "prettier": "^3.8.3"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^1.4.0",
+    "effect": "^4.0.0-beta.66",
+    "srvx": "^0.11.15",
+    "uuid": "^14.0.0"
   }
 }

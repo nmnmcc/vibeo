@@ -1,3 +1,11 @@
 {
-  "js/ts.tsdk.path": "node_modules/typescript/lib"
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "js/ts.preferences.autoImportFileExcludePatterns": ["references/**"],
+  "files.watcherExclude": {
+    "references/**": true
+  },
+  "search.exclude": {
+    "references/**": true
+  },
+  "cSpell.words": ["kubernetes", "manim", "vibeo"]
 }
